@@ -1,7 +1,7 @@
 {
-  "name": "fitflow-backend",
+  "name": "fittflow-backend",
   "version": "1.0.0",
-  "description": "Backend for FitFlow Gym Management via Supabase Service Role Key",
+  "description": "Backend for FittFlow Gym Management via Supabase Service Role Key",
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",
@@ -10,9 +10,11 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
+    "@types/morgan": "^1.9.10",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "morgan": "^1.10.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
