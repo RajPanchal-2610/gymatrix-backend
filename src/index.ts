@@ -2,12 +2,14 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
+
+// Load environment variables IMMEDIATELY
+dotenv.config();
+
 import staffRoutes from './routes/staffRoutes';
 import rolesRoutes from './routes/rolesRoutes';
 import attendanceRoutes from './routes/attendanceRoutes';
-
-// Load environment variables
-dotenv.config();
+import paymentRoutes from './routes/paymentRoutes';
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -20,6 +22,7 @@ app.use(express.json());
 app.use('/api/staff', staffRoutes);
 app.use('/api/roles', rolesRoutes);
 app.use('/api/attendance', attendanceRoutes);
+app.use('/api/payments', paymentRoutes);
 
 app.get('/', (req, res) => {
   res.send('FitFlow Custom Backend API is running!');
