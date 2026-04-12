@@ -24,15 +24,82 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing required parameters' });
     }
 
+    // 0. EXTENSION DECREASE PREVENTION: Verify extensions are not being decreased
+    const { data: currentSubscription } = await supabaseAdmin
+      .from('subscriptions')
+      .select('extra_gyms, extra_members')
+      .eq('id', subscriptionId)
+      .maybeSingle();
+
+    if (currentSubscription) {
+      const currentExtraGyms = currentSubscription.extra_gyms || 0;
+      const currentExtraMembers = currentSubscription.extra_members || 0;
+
+      if (extra_gyms < currentExtraGyms) {
+        return res.status(400).json({
+          error: `Extra gyms cannot be decreased. Current: ${currentExtraGyms}, Requested: ${extra_gyms}. Extensions can only be maintained or increased during plan purchase.`,
+          code: 'EXTENSION_DECREASE_NOT_ALLOWED'
+        });
+      }
+
+      if (extra_members < currentExtraMembers) {
+        return res.status(400).json({
+          error: `Extra members cannot be decreased. Current: ${currentExtraMembers}, Requested: ${extra_members}. Extensions can only be maintained or increased during plan purchase.`,
+          code: 'EXTENSION_DECREASE_NOT_ALLOWED'
+        });
+      }
+    }
+
     // 1. Fetch the actual plan price
     const { data: planPrice, error: priceError } = await supabaseAdmin
       .from('plan_prices')
-      .select('price, duration_unit, duration_value')
+      .select('price, duration_unit, duration_value, plan_id')
       .eq('id', planPriceId)
       .single();
 
     if (priceError || !planPrice) {
       return res.status(404).json({ error: 'Plan price not found' });
+    }
+
+    // 1b. DOWNGRADE PREVENTION: Check if user is trying to purchase a lower-tier plan
+    // while their current subscription is still active
+    const { data: activeSubscription } = await supabaseAdmin
+      .from('subscriptions')
+      .select('plan_id, status, end_date')
+      .eq('user_id', userId)
+      .in('status', ['active', 'Active'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (activeSubscription && new Date(activeSubscription.end_date) > new Date()) {
+      // Fetch the current plan's tier identifier (using max_gyms as tier indicator)
+      const { data: currentPlan } = await supabaseAdmin
+        .from('plans')
+        .select('max_gyms, max_members')
+        .eq('id', activeSubscription.plan_id)
+        .maybeSingle();
+
+      // Fetch the target plan's tier identifier
+      const { data: targetPlan } = await supabaseAdmin
+        .from('plans')
+        .select('max_gyms, max_members')
+        .eq('id', planPrice.plan_id)
+        .maybeSingle();
+
+      if (currentPlan && targetPlan) {
+        // A plan is considered "lower" if it has fewer max_gyms OR fewer max_members
+        const isDowngrade =
+          targetPlan.max_gyms < currentPlan.max_gyms ||
+          targetPlan.max_members < currentPlan.max_members;
+
+        if (isDowngrade) {
+          return res.status(400).json({
+            error: 'Cannot downgrade your plan while your current subscription is active. Please wait until your current plan expires or contact support.',
+            code: 'DOWNGRADE_NOT_ALLOWED'
+          });
+        }
+      }
     }
 
     // 2. Fetch extension prices to calculate the additional cost
@@ -55,35 +122,81 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
 
     // --- PRO-RATING LOGIC (CARRY-OVER BALANCE) ---
     let carriedCredit = 0;
+    let extensionCarryOverCredit = 0;
+    let extensionCreditBreakdown: { type: string; originalAmount: number; credit: number; daysRemaining: number; totalDays: number }[] = [];
     const { data: currentSub } = await supabaseAdmin
       .from('subscriptions')
-      .select('amount, start_date, end_date, status')
+      .select('id, amount, start_date, end_date, status, plan_price_id, plan_id')
       .eq('user_id', userId)
       .in('status', ['active', 'Active'])
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    if (currentSub && currentSub.amount > 0) {
+    if (currentSub && currentSub.plan_price_id) {
       const now = new Date();
       const startDate = new Date(currentSub.start_date);
       const endDate = new Date(currentSub.end_date);
-      
+
       if (endDate > now) {
-        const msInDay = 24 * 60 * 60 * 1000;
-        const totalDurationDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / msInDay));
-        const remainingDays = Math.max(0, Math.ceil((endDate.getTime() - now.getTime()) / msInDay));
-        
-        // Calculate raw credit based on remaining whole days
-        carriedCredit = Math.floor((currentSub.amount / totalDurationDays) * remainingDays);
-        console.log(`User ${userId} has ${remainingDays} days left. Credit: ₹${carriedCredit}`);
+        // Fetch the PREVIOUS plan's base price (without extensions)
+        const { data: previousPlanPrice } = await supabaseAdmin
+          .from('plan_prices')
+          .select('price')
+          .eq('id', currentSub.plan_price_id)
+          .maybeSingle();
+
+        if (previousPlanPrice && previousPlanPrice.price > 0) {
+          const msInDay = 24 * 60 * 60 * 1000;
+          const totalDurationDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / msInDay));
+          const remainingDays = Math.max(0, Math.ceil((endDate.getTime() - now.getTime()) / msInDay));
+
+          // Calculate credit based on PREVIOUS PLAN'S base price and remaining days
+          carriedCredit = Math.floor((previousPlanPrice.price / totalDurationDays) * remainingDays);
+          console.log(`User ${userId} has ${remainingDays} days left on previous plan. Credit: ₹${carriedCredit} (based on plan price ₹${previousPlanPrice.price})`);
+
+          // --- EXTENSION PRO-RATED CREDIT ---
+          // Fetch extension addons for the current subscription to calculate unused value
+          const { data: addons } = await supabaseAdmin
+            .from('subscription_addons')
+            .select('*')
+            .eq('subscription_id', currentSub.id);
+
+          if (addons && addons.length > 0) {
+            const msInDay = 24 * 60 * 60 * 1000;
+
+            for (const addon of addons) {
+              const addonPurchaseDate = new Date(addon.created_at);
+              const addonTotalDays = Math.max(1, Math.ceil((endDate.getTime() - addonPurchaseDate.getTime()) / msInDay));
+              const addonRemainingDays = Math.max(0, Math.ceil((endDate.getTime() - now.getTime()) / msInDay));
+
+              if (addonRemainingDays > 0 && addonTotalDays > 0) {
+                const proRateRatio = addonRemainingDays / addonTotalDays;
+                const addonCredit = Math.floor(addon.amount_paid * proRateRatio);
+
+                extensionCarryOverCredit += addonCredit;
+                extensionCreditBreakdown.push({
+                  type: addon.type,
+                  originalAmount: addon.amount_paid,
+                  credit: addonCredit,
+                  daysRemaining: addonRemainingDays,
+                  totalDays: addonTotalDays
+                });
+
+                console.log(`Extension addon ${addon.type}: ${addonRemainingDays}/${addonTotalDays} days unused. Credit: ₹${addonCredit} (original: ₹${addon.amount_paid})`);
+              }
+            }
+          }
+        }
       }
     }
 
-    // Final Amount to charge (Plan Price + Extensions - Carried Credit)
+    const totalCarryOverCredit = carriedCredit + extensionCarryOverCredit;
+
+    // Final Amount to charge (Plan Price + Extensions - Total Carried Credit)
     // Minimum 1 rupee for Razorpay
     const baseTotal = planPrice.price + extensionCharge;
-    const amountTotal = Math.max(1, baseTotal - carriedCredit);
+    const amountTotal = Math.max(1, baseTotal - totalCarryOverCredit);
     const amountInPaise = Math.round(amountTotal * 100);
 
     // 3. Generate generic receipt ID
@@ -101,6 +214,8 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
         extra_gyms: extra_gyms.toString(),
         extra_members: extra_members.toString(),
         carried_credit: carriedCredit.toString(),
+        extension_carry_over_credit: extensionCarryOverCredit.toString(),
+        total_carry_over_credit: totalCarryOverCredit.toString(),
         original_price: baseTotal.toString()
       }
     };
