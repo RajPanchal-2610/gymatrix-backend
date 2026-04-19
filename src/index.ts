@@ -10,6 +10,8 @@ import staffRoutes from './routes/staffRoutes';
 import rolesRoutes from './routes/rolesRoutes';
 import attendanceRoutes from './routes/attendanceRoutes';
 import paymentRoutes from './routes/paymentRoutes';
+import notificationRoutes from './routes/notificationRoutes';
+import { subscriptionScheduler } from './services/subscriptionScheduler';
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -23,6 +25,7 @@ app.use('/api/staff', staffRoutes);
 app.use('/api/roles', rolesRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 app.get('/', (req, res) => {
   res.send('FitFlow Custom Backend API is running!');
@@ -30,4 +33,7 @@ app.get('/', (req, res) => {
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
+  
+  // Initialize the subscription scheduler
+  subscriptionScheduler.start();
 });
