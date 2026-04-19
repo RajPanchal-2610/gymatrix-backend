@@ -285,6 +285,42 @@ class EmailService {
     `;
   }
 
+  async sendContactConfirmation(to: string, userName: string, subject: string): Promise<boolean> {
+    const emailSubject = `Confirmation: We've received your message regarding "${subject}"`;
+    const html = `
+      <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px;">
+        <h2 style="color: #2563eb;">Hello ${userName},</h2>
+        <p>Thank you for contacting FitFlow! We've received your message regarding <strong>${subject}</strong>.</p>
+        <p>Our team will review your inquiry and get back to you as soon as possible.</p>
+        <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;">
+        <p style="color: #64748b; font-size: 14px;">This is an automated confirmation. No need to reply to this email.</p>
+        <p style="font-weight: bold; color: #0f172a;">Best regards,<br>The FitFlow Team</p>
+      </div>
+    `;
+    return this.sendEmail({ to, subject: emailSubject, html });
+  }
+
+  async sendContactNotificationToAdmin(details: { full_name: string, email: string, subject: string, message: string }): Promise<boolean> {
+    const adminEmail = process.env.EMAIL_USER || '';
+    if (!adminEmail) return false;
+
+    const emailSubject = `New Contact Form Submission: ${details.subject}`;
+    const html = `
+      <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px;">
+        <h2 style="color: #2563eb;">New Message Received</h2>
+        <p><strong>From:</strong> ${details.full_name} (${details.email})</p>
+        <p><strong>Subject:</strong> ${details.subject}</p>
+        <p><strong>Message:</strong></p>
+        <div style="background-color: #f8fafc; padding: 15px; border-radius: 8px; border: 1px solid #e2e8f0;">
+          ${details.message.replace(/\n/g, '<br>')}
+        </div>
+        <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;">
+        <p style="font-size: 14px;">Timestamp: ${new Date().toLocaleString()}</p>
+      </div>
+    `;
+    return this.sendEmail({ to: adminEmail, subject: emailSubject, html });
+  }
+
   async verifyConnection(): Promise<boolean> {
     if (!this.transporter) {
       console.error('❌ Email transporter not initialized');
