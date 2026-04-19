@@ -4,7 +4,8 @@ import {
   verifySubscriptionPayment, 
   getSubscriptionHistory,
   createExtensionOrder,
-  verifyExtensionPayment
+  verifyExtensionPayment,
+  getInvoiceDetails
 } from '../controllers/paymentController';
 import { getExtensionPrices, updateExtensionPrice, deleteExtensionPrice } from '../controllers/extensionController';
 
@@ -20,5 +21,6 @@ router.put('/extensions/prices', updateExtensionPrice);
 router.delete('/extensions/prices/:id', deleteExtensionPrice);
 router.post('/extensions/create-order', createExtensionOrder);
 router.post('/extensions/verify-payment', verifyExtensionPayment);
+router.get('/invoice/:transactionId', getInvoiceDetails);
 
 export default router;

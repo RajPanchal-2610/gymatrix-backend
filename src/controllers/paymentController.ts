@@ -16,6 +16,42 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET!,
 });
 
+/**
+ * Generates a sequential invoice number
+ */
+const getNextInvoiceNumber = async (prefix: string = 'INV') => {
+  try {
+    // 1. Get the last transaction that has an invoice number with this prefix
+    const { data: lastTx } = await supabaseAdmin
+      .from('subscription_transactions')
+      .select('invoice_number')
+      .ilike('invoice_number', `${prefix}-%`)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    let nextNumber = 1;
+    const currentYear = new Date().getFullYear();
+
+    if (lastTx && lastTx.invoice_number) {
+      const parts = lastTx.invoice_number.split('-');
+      // For INV-2024-00001: parts.length = 3, num is at index 2
+      // For INV-EXT-2024-00001: parts.length = 4, num is at index 3
+      const numStr = parts[parts.length - 1];
+      const lastNum = parseInt(numStr);
+      if (!isNaN(lastNum)) {
+        nextNumber = lastNum + 1;
+      }
+    }
+
+    return `${prefix}-${currentYear}-${nextNumber.toString().padStart(5, '0')}`;
+  } catch (error) {
+    console.error("Error generating invoice number:", error);
+    // Fallback if sequence fails
+    return `${prefix}-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+  }
+};
+
 export const createSubscriptionOrder = async (req: Request, res: Response) => {
   try {
     const { userId, planPriceId, subscriptionId, extra_gyms = 0, extra_members = 0 } = req.body;
@@ -308,8 +344,8 @@ export const verifySubscriptionPayment = async (req: Request, res: Response) => 
     const feeInRupees = paymentInfo.fee ? Number(paymentInfo.fee) / 100 : null;
     const taxInRupees = paymentInfo.tax ? Number(paymentInfo.tax) / 100 : null;
 
-    // Generate Invoice Number dynamically
-    const invoiceNumber = `INV-${new Date().getFullYear()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    // Generate Invoice Number Sequentially (Unified INV prefix)
+    const invoiceNumber = await getNextInvoiceNumber('INV');
 
     // 4. Update the transaction to success
     const { error: txUpdateError } = await supabaseAdmin
@@ -439,6 +475,106 @@ export const verifySubscriptionPayment = async (req: Request, res: Response) => 
   }
 };
 
+export const getInvoiceDetails = async (req: Request, res: Response) => {
+  try {
+    const { transactionId } = req.params;
+
+    // Fetch transaction details including user and subscription info
+    const { data: tx, error: txError } = await supabaseAdmin
+      .from('subscription_transactions')
+      .select(`
+        *,
+        subscriptions (
+          *,
+          plans (name, description),
+          plan_prices (duration_unit, duration_value)
+        )
+      `)
+      .eq('id', transactionId)
+      .single();
+
+    if (txError || !tx) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // Try to get user ID from transaction, fall back to subscription if needed
+    const userId = tx.user_id || tx.subscriptions?.user_id;
+
+    let customerName = 'Valued Customer';
+    let customerEmail = 'N/A';
+
+    if (userId) {
+      // 1. Fetch Auth User info (for email and metadata)
+      const { data: userData } = await supabaseAdmin.auth.admin.getUserById(userId);
+      const user = userData?.user;
+      
+      if (user) {
+        customerEmail = user.email || 'N/A';
+        
+        // 2. Fetch Profile (Sidebar style)
+        const { data: profile } = await supabaseAdmin
+          .from('profiles')
+          .select('full_name')
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        // 3. Name Priority: Profile > User Metadata > Email Prefix
+        customerName = profile?.full_name || 
+                       user.user_metadata?.full_name || 
+                       user.user_metadata?.name || 
+                       user.email?.split('@')[0] || 
+                       'Valued Customer';
+      }
+    }
+
+    // If it's an extension, get those details
+    let extensionDetails = null;
+    if (tx.metadata && (tx.metadata.extra_gyms || tx.metadata.extra_members)) {
+      extensionDetails = tx.metadata;
+    } else {
+      // Check subscription_addons for this transaction
+      const { data: addon } = await supabaseAdmin
+        .from('subscription_addons')
+        .select('*')
+        .eq('transaction_id', transactionId)
+        .maybeSingle();
+      if (addon) extensionDetails = addon;
+    }
+
+    // Unified fallback prefix 'INV' for all transaction types
+    const fallbackPrefix = 'INV';
+    const fallbackNumber = `${fallbackPrefix}-${new Date(tx.created_at).getFullYear()}-${tx.id.toString().substring(0, 8).toUpperCase()}`;
+
+    res.json({
+      invoice: {
+        number: tx.invoice_number || fallbackNumber,
+        date: tx.created_at,
+        amount: tx.amount_total,
+        payment_method: tx.payment_method || 'Razorpay',
+        status: tx.status,
+        razorpay_payment_id: tx.razorpay_payment_id
+      },
+      customer: {
+        name: customerName,
+        email: customerEmail,
+      },
+      items: [
+        {
+          name: tx.subscriptions?.plans?.name || 'Gym Subscription',
+          description: tx.subscriptions ? `${tx.subscriptions.plan_prices?.duration_value} ${tx.subscriptions.plan_prices?.duration_unit}(s)` : 'N/A',
+          amount: tx.amount_total,
+          isExtension: !!extensionDetails,
+          extensionDetails
+        }
+      ]
+    });
+
+  } catch (error) {
+    console.error("Error fetching invoice details:", error);
+    res.status(500).json({ error: 'Failed to fetch invoice' });
+  }
+};
+
 export const getSubscriptionHistory = async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
@@ -462,32 +598,47 @@ export const getSubscriptionHistory = async (req: Request, res: Response) => {
       return res.status(500).json({ error: 'Failed to fetch subscriptions' });
     }
 
-    // 2. Fetch Extension Add-ons for these subscriptions
+    // 2. Fetch Extension Add-ons and Transactions for these subscriptions
     const subIds = subs?.map(s => s.id) || [];
     const { data: addons } = subIds.length > 0 ? await supabaseAdmin
       .from('subscription_addons')
       .select('*')
       .in('subscription_id', subIds) : { data: [] };
 
+    const { data: txs } = subIds.length > 0 ? await supabaseAdmin
+      .from('subscription_transactions')
+      .select('id, subscription_id, invoice_number, status')
+      .in('subscription_id', subIds)
+      .eq('status', 'success') : { data: [] };
+
     // 3. Nest Add-ons into their parent Subscriptions
     const nestedHistory = (subs || []).map(s => {
       const subAddons = (addons || [])
         .filter(a => a.subscription_id === s.id)
-        .map(a => ({
-          id: a.id,
-          isAddon: true,
-          name: `Extra ${a.quantity} ${a.type}${a.quantity > 1 ? 's' : ''}`,
-          amount: a.amount_paid,
-          status: 'active',
-          created_at: a.created_at,
-          duration: s.plan_prices ? `${s.plan_prices.duration_value} ${s.plan_prices.duration_unit}(s)` : 'N/A', // Match Parent Duration
-          quantity: a.quantity,
-          type: a.type
-        }))
+        .map(a => {
+          const addonTx = (txs || []).find(t => t.id === a.transaction_id);
+          return {
+            id: a.id,
+            tx_id: a.transaction_id,
+            invoice_number: addonTx?.invoice_number || 'N/A',
+            isAddon: true,
+            name: `Extra ${a.quantity} ${a.type}${a.quantity > 1 ? 's' : ''}`,
+            amount: a.amount_paid,
+            status: 'active',
+            created_at: a.created_at,
+            duration: s.plan_prices ? `${s.plan_prices.duration_value} ${s.plan_prices.duration_unit}(s)` : 'N/A', // Match Parent Duration
+            quantity: a.quantity,
+            type: a.type
+          };
+        })
         .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+
+      const subTx = (txs || []).find(t => t.subscription_id === s.id && t.invoice_number?.startsWith('INV-2'));
 
       return {
         id: s.id,
+        tx_id: subTx?.id || null,
+        invoice_number: subTx?.invoice_number || 'N/A',
         isAddon: false,
         name: s.plans?.name || 'Plan Update',
         amount: s.amount || 0,
@@ -588,6 +739,11 @@ export const createExtensionOrder = async (req: Request, res: Response) => {
         amount_total: amountTotal,
         amount_paid: amountTotal,
         razorpay_order_id: order.id,
+        metadata: { 
+          type: type, 
+          quantity: quantity,
+          isExtension: true 
+        }
       })
       .select('id')
       .single();
@@ -620,8 +776,11 @@ export const verifyExtensionPayment = async (req: Request, res: Response) => {
       transactionId,
       subscriptionId,
       extensionType,
+      type, // Fallback field
       quantity
     } = req.body;
+
+    const finalType = extensionType || type;
 
     // 1. Signature check
     const bodyText = razorpay_order_id + "|" + razorpay_payment_id;
@@ -643,8 +802,10 @@ export const verifyExtensionPayment = async (req: Request, res: Response) => {
     const fee = paymentInfo.fee ? Number(paymentInfo.fee) / 100 : 0;
     const tax = paymentInfo.tax ? Number(paymentInfo.tax) / 100 : 0;
 
-    // 3. Update Transaction
-    await supabaseAdmin
+    // 3. Update Transaction with Unified Sequential Invoice (INV prefix)
+    const extensionInvoice = await getNextInvoiceNumber('INV');
+    
+    const { error: txUpdateError } = await supabaseAdmin
       .from('subscription_transactions')
       .update({
         status: 'success',
@@ -653,9 +814,14 @@ export const verifyExtensionPayment = async (req: Request, res: Response) => {
         payment_method: paymentInfo.method || 'unknown',
         razorpay_fee: fee,
         razorpay_tax: tax,
-        invoice_number: `INV-EXT-${new Date().getFullYear()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`
+        invoice_number: extensionInvoice
       })
       .eq('id', transactionId);
+
+    if (txUpdateError) {
+      console.error("Critical: Failed to update transaction invoice_number", txUpdateError);
+      // We continue since the money was taken, but this explains the null invoice number
+    }
 
     // 4. Fetch the existing subscription
     const { data: sub } = await supabaseAdmin
@@ -665,11 +831,11 @@ export const verifyExtensionPayment = async (req: Request, res: Response) => {
       .single();
 
     if (sub) {
-      const typeLower = extensionType.toLowerCase();
+      const typeLower = (finalType || 'gym').toLowerCase();
       const isGym = typeLower.startsWith('gym');
       const isMember = typeLower.startsWith('member');
 
-      console.log(`Verifying payment for ${extensionType}. Classified as - Gym: ${isGym}, Member: ${isMember}`);
+      console.log(`Verifying payment for ${finalType}. Classified as - Gym: ${isGym}, Member: ${isMember}`);
 
       const extraG = isGym ? (sub.extra_gyms || 0) + Number(quantity) : (sub.extra_gyms || 0);
       const extraM = isMember ? (sub.extra_members || 0) + Number(quantity) : (sub.extra_members || 0);
