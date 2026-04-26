@@ -52,9 +52,126 @@ const getNextInvoiceNumber = async (prefix: string = 'INV') => {
   }
 };
 
+/**
+ * Helper to activate a subscription after payment or free purchase
+ */
+const activateSubscriptionInDB = async (transactionId: string, planPriceId: number, subscriptionId: string) => {
+  // 1. Fetch Transaction Data
+  const { data: txData } = await supabaseAdmin
+    .from('subscription_transactions')
+    .select('*')
+    .eq('id', transactionId)
+    .single();
+
+  const meta = txData?.metadata as any || {};
+  const finalExtraG = typeof meta.extra_gyms !== 'undefined' ? Number(meta.extra_gyms) : null;
+  const finalExtraM = typeof meta.extra_members !== 'undefined' ? Number(meta.extra_members) : null;
+
+  // Record Coupon Usage
+  if (txData?.applied_coupon_id) {
+    await supabaseAdmin.from('coupon_usage').insert({
+      coupon_id: txData.applied_coupon_id,
+      user_id: txData.user_id,
+      transaction_id: transactionId
+    });
+  }
+
+  // 2. Fetch the plan duration
+  const { data: planPrice } = await supabaseAdmin
+    .from('plan_prices')
+    .select('duration_unit, duration_value, plan_id, price')
+    .eq('id', planPriceId)
+    .single();
+
+  if (!planPrice) throw new Error("Plan price not found during activation");
+
+  // Fetch the associated plan to get max_members and max_gyms
+  const { data: plan } = await supabaseAdmin
+    .from('plans')
+    .select('max_members, max_gyms')
+    .eq('id', planPrice.plan_id)
+    .single();
+
+  // Fetch existing subscription to append time/metadata
+  const { data: existingSub } = await supabaseAdmin
+    .from('subscriptions')
+    .select('*')
+    .eq('id', subscriptionId)
+    .single();
+
+  if (!existingSub || !plan) throw new Error("Subscription or Plan not found during activation");
+
+  const now = new Date();
+  let currentStart = now;
+  let currentEnd = new Date(now);
+
+  if (planPrice.duration_unit === 'month') {
+    currentEnd.setMonth(currentEnd.getMonth() + planPrice.duration_value);
+  } else if (planPrice.duration_unit === 'year') {
+    currentEnd.setFullYear(currentEnd.getFullYear() + planPrice.duration_value);
+  }
+
+  const extraG = finalExtraG !== null ? finalExtraG : (existingSub.extra_gyms || 0);
+  const extraM = finalExtraM !== null ? finalExtraM : (existingSub.extra_members || 0);
+
+  // 1. Mark old subscriptions as expired
+  await supabaseAdmin
+    .from('subscriptions')
+    .update({ status: 'expired' })
+    .eq('user_id', existingSub.user_id)
+    .in('status', ['active', 'trial', 'Active', 'Trial']);
+
+  // 2. Insert NEW Subscription
+  const { data: newSub, error: subInsertError } = await supabaseAdmin
+    .from('subscriptions')
+    .insert({
+      user_id: existingSub.user_id,
+      status: 'active',
+      end_date: currentEnd.toISOString(),
+      start_date: currentStart.toISOString(),
+      plan_id: planPrice.plan_id,
+      plan_price_id: planPriceId,
+      max_members: plan.max_members + extraM,
+      max_gyms: plan.max_gyms + extraG,
+      extra_members: extraM,
+      extra_gyms: extraG,
+      amount: txData?.amount_total || planPrice.price
+    })
+    .select()
+    .single();
+
+  if (subInsertError || !newSub) throw new Error("Failed to insert new subscription record");
+
+  // 3. Update transaction to success and link to new subscription
+  await supabaseAdmin
+    .from('subscription_transactions')
+    .update({
+      subscription_id: newSub.id,
+      status: 'success'
+    })
+    .eq('id', transactionId);
+
+  // 4. Sync Features
+  const { data: planFeatures } = await supabaseAdmin
+    .from('plan_features')
+    .select('feature_id, value')
+    .eq('plan_id', planPrice.plan_id);
+
+  if (planFeatures && planFeatures.length > 0) {
+    const newFeatures = planFeatures.map(f => ({
+      subscription_id: newSub.id,
+      feature_id: f.feature_id,
+      value: f.value
+    }));
+    await supabaseAdmin.from('subscription_features').insert(newFeatures);
+  }
+
+  return newSub;
+};
+
 export const createSubscriptionOrder = async (req: Request, res: Response) => {
   try {
-    const { userId, planPriceId, subscriptionId, extra_gyms = 0, extra_members = 0 } = req.body;
+    const { userId, planPriceId, subscriptionId, extra_gyms = 0, extra_members = 0, couponCode } = req.body;
 
     if (!userId || !planPriceId || !subscriptionId) {
       return res.status(400).json({ error: 'Missing required parameters' });
@@ -156,6 +273,81 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
       }
     }
 
+    // --- COUPON VALIDATION ---
+    let couponDiscount = 0;
+    let couponId = null;
+
+    if (couponCode) {
+      // 1. Fetch Coupon Data
+      const { data: coupon, error: couponError } = await supabaseAdmin
+        .from('coupons')
+        .select('*')
+        .eq('code', couponCode.trim().toUpperCase())
+        .eq('is_active', true)
+        .single();
+
+      if (couponError || !coupon) {
+        return res.status(400).json({ error: 'Invalid or inactive coupon code' });
+      }
+
+      // 2. Check Expiry
+      if (coupon.expiry_date && new Date(coupon.expiry_date) < new Date()) {
+        return res.status(400).json({ error: 'This coupon has expired' });
+      }
+
+      // 3. Check Minimum Purchase
+      const totalAmountBeforeDiscount = planPrice.price + extensionCharge;
+      if (Math.round(totalAmountBeforeDiscount) < coupon.min_purchase_amount) {
+        return res.status(400).json({ error: `Minimum purchase amount not met (Min: ₹${coupon.min_purchase_amount})` });
+      }
+
+      // 4. Check Multi-Plan Restriction (Array check)
+      if (coupon.applicable_plan_ids && planPrice.plan_id) {
+        const currentPlanIdStr = String(planPrice.plan_id);
+        const allowedPlanIds = coupon.applicable_plan_ids.map((id: any) => String(id));
+        
+        if (!allowedPlanIds.includes(currentPlanIdStr)) {
+          return res.status(400).json({ error: 'This coupon is not applicable to the selected plan' });
+        }
+      }
+
+      // 5. Check Multi-Duration Restriction (Array check)
+      if (coupon.applicable_duration_units && !coupon.applicable_duration_units.includes(planPrice.duration_unit)) {
+        return res.status(400).json({ error: `This coupon is not valid for ${planPrice.duration_unit}ly subscriptions` });
+      }
+
+      // 6. Check Usage Limits
+      const { count: totalUsageCount } = await supabaseAdmin
+        .from('coupon_usage')
+        .select('*', { count: 'exact', head: true })
+        .eq('coupon_id', coupon.id);
+
+      if (coupon.total_usage_limit !== null && (totalUsageCount || 0) >= coupon.total_usage_limit) {
+        return res.status(400).json({ error: 'This coupon usage limit has been reached' });
+      }
+
+      const { count: userUsageCount } = await supabaseAdmin
+        .from('coupon_usage')
+        .select('*', { count: 'exact', head: true })
+        .eq('coupon_id', coupon.id)
+        .eq('user_id', userId);
+
+      if ((userUsageCount || 0) >= coupon.user_usage_limit) {
+        return res.status(400).json({ error: 'You have already used this coupon' });
+      }
+
+      // 7. Calculate Discount
+      if (coupon.discount_type === 'FLAT') {
+        couponDiscount = coupon.discount_value;
+      } else {
+        couponDiscount = (totalAmountBeforeDiscount * coupon.discount_value) / 100;
+        if (coupon.max_discount_amount && couponDiscount > coupon.max_discount_amount) {
+          couponDiscount = coupon.max_discount_amount;
+        }
+      }
+      couponId = coupon.id;
+    }
+
     // --- PRO-RATING LOGIC (CARRY-OVER BALANCE) ---
     let carriedCredit = 0;
     let extensionCarryOverCredit = 0;
@@ -229,11 +421,49 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
 
     const totalCarryOverCredit = carriedCredit + extensionCarryOverCredit;
 
-    // Final Amount to charge (Plan Price + Extensions - Total Carried Credit)
-    // Minimum 1 rupee for Razorpay
+    // Final Amount to charge (Plan Price + Extensions - Coupon - Total Carried Credit)
     const baseTotal = planPrice.price + extensionCharge;
-    const amountTotal = Math.max(1, baseTotal - totalCarryOverCredit);
+    const discountedTotal = Math.max(0, baseTotal - couponDiscount);
+    const amountTotal = Math.max(0, discountedTotal - totalCarryOverCredit);
     const amountInPaise = Math.round(amountTotal * 100);
+
+    // --- HANDLE FREE SUBSCRIPTION (100% Discount) ---
+    if (amountTotal === 0) {
+      console.log(`Processing FREE subscription for user ${userId} (100% discount applied)`);
+      
+      const receiptId = `FREE-${crypto.randomUUID().split('-')[0]}`;
+      
+      // Since it's free, we don't need Razorpay. We create a 'paid' transaction immediately.
+      const { data: transaction, error: txError } = await supabaseAdmin
+        .from('subscription_transactions')
+        .insert({
+          user_id: userId,
+          subscription_id: subscriptionId,
+          plan_price_id: planPriceId,
+          status: 'paid', // Mark as paid immediately
+          receipt_id: receiptId,
+          amount_total: 0,
+          amount_paid: 0,
+          razorpay_order_id: 'FREE_ORDER_' + receiptId,
+          applied_coupon_id: couponId,
+          discount_amount: couponDiscount,
+          metadata: { extra_gyms, extra_members, isFree: true }
+        })
+        .select('id')
+        .single();
+
+      if (txError) throw txError;
+
+      // --- ACTIVATE IMMEDIATELY ---
+      const newSub = await activateSubscriptionInDB(transaction.id, planPriceId, subscriptionId);
+
+      return res.json({
+        isFree: true,
+        transactionId: transaction.id,
+        subscriptionId: newSub.id,
+        message: 'Subscription activated for free!'
+      });
+    }
 
     // 3. Generate generic receipt ID
     const receiptId = `RCPT-${crypto.randomUUID().split('-')[0]}`;
@@ -252,7 +482,9 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
         carried_credit: carriedCredit.toString(),
         extension_carry_over_credit: extensionCarryOverCredit.toString(),
         total_carry_over_credit: totalCarryOverCredit.toString(),
-        original_price: baseTotal.toString()
+        original_price: baseTotal.toString(),
+        coupon_id: couponId,
+        coupon_discount: couponDiscount.toString()
       }
     };
 
@@ -270,6 +502,8 @@ export const createSubscriptionOrder = async (req: Request, res: Response) => {
         amount_total: amountTotal,
         amount_paid: amountTotal,
         razorpay_order_id: order.id,
+        applied_coupon_id: couponId,
+        discount_amount: couponDiscount,
         metadata: { extra_gyms, extra_members } // Store for verification
       })
       .select('id')
@@ -331,7 +565,7 @@ export const verifySubscriptionPayment = async (req: Request, res: Response) => 
     // 1b. Fetch transaction metadata for extension quantities and total amount
     const { data: txData } = await supabaseAdmin
       .from('subscription_transactions')
-      .select('metadata, amount_total')
+      .select('metadata, amount_total, applied_coupon_id, user_id')
       .eq('id', transactionId)
       .single();
 
@@ -359,113 +593,16 @@ export const verifySubscriptionPayment = async (req: Request, res: Response) => 
         razorpay_tax: taxInRupees,
         invoice_number: invoiceNumber
       })
-      .eq('id', transactionId);
+      .eq('id', transactionId)
+      .select('applied_coupon_id, user_id')
+      .single();
 
     if (txUpdateError) {
       console.error("Failed to update transaction status", txUpdateError);
     }
 
-    // 5. Update actual Subscription Duration
-    // Fetch the plan duration
-    const { data: planPrice } = await supabaseAdmin
-      .from('plan_prices')
-      .select('duration_unit, duration_value, plan_id, price')
-      .eq('id', planPriceId)
-      .single();
-
-    if (planPrice) {
-      // Fetch the associated plan to get max_members and max_gyms
-      const { data: plan } = await supabaseAdmin
-        .from('plans')
-        .select('max_members, max_gyms')
-        .eq('id', planPrice.plan_id)
-        .single();
-
-      // We need to fetch the existing subscription to append time
-      const { data: existingSub } = await supabaseAdmin
-        .from('subscriptions')
-        .select('*')
-        .eq('id', subscriptionId)
-        .single();
-
-      if (existingSub && plan) {
-        // Add logic to calculate new start and end dates
-        const now = new Date();
-
-        // Plan always starts from today and ends exactly at the end of the new duration
-        let currentStart = now;
-        let currentEnd = new Date(now);
-
-        // Add new plan duration
-        if (planPrice.duration_unit === 'month') {
-          currentEnd.setMonth(currentEnd.getMonth() + planPrice.duration_value);
-        } else if (planPrice.duration_unit === 'year') {
-          currentEnd.setFullYear(currentEnd.getFullYear() + planPrice.duration_value);
-        }
-
-        // Use metadata amounts if available, otherwise fallback to existing (carryover default)
-        const extraG = finalExtraG !== null ? finalExtraG : (existingSub.extra_gyms || 0);
-        const extraM = finalExtraM !== null ? finalExtraM : (existingSub.extra_members || 0);
-
-        // 1. Mark all existing/active subscriptions for this user as 'expired'
-        await supabaseAdmin
-          .from('subscriptions')
-          .update({
-            status: 'expired'
-          })
-          .eq('user_id', existingSub.user_id)
-          .in('status', ['active', 'trial', 'Active', 'Trial']);
-
-        // 2. Insert NEW Subscription record instead of updating
-        const { data: newSub, error: subInsertError } = await supabaseAdmin
-          .from('subscriptions')
-          .insert({
-            user_id: existingSub.user_id,
-            status: 'active',
-            end_date: currentEnd.toISOString(),
-            start_date: currentStart.toISOString(),
-            plan_id: planPrice.plan_id,
-            plan_price_id: planPriceId,
-            max_members: plan.max_members + extraM,
-            max_gyms: plan.max_gyms + extraG,
-            extra_members: extraM,
-            extra_gyms: extraG,
-            amount: txData?.amount_total || planPrice.price // Total paid (Plan + Extensions)
-          })
-          .select()
-          .single();
-
-        if (subInsertError || !newSub) {
-          console.error("Failed to insert new subscription", subInsertError);
-          throw new Error("Subscription activation failed");
-        }
-
-        // 3. Update transaction to point to the NEW subscription ID
-        await supabaseAdmin
-          .from('subscription_transactions')
-          .update({
-            subscription_id: newSub.id,
-            status: 'success'
-          })
-          .eq('id', transactionId);
-
-        // 4. Sync Features with the NEW subscription ID
-        const { data: planFeatures } = await supabaseAdmin
-          .from('plan_features')
-          .select('feature_id, value')
-          .eq('plan_id', planPrice.plan_id);
-
-        if (planFeatures && planFeatures.length > 0) {
-          // Insert new features for the new subscription
-          const newFeatures = planFeatures.map(f => ({
-            subscription_id: newSub.id,
-            feature_id: f.feature_id,
-            value: f.value
-          }));
-          await supabaseAdmin.from('subscription_features').insert(newFeatures);
-        }
-      }
-    }
+    // --- ACTIVATE SUBSCRIPTION ---
+    await activateSubscriptionInDB(transactionId, planPriceId, subscriptionId);
 
     res.json({ success: true, message: 'Payment verified and subscription activated.' });
 
@@ -507,10 +644,10 @@ export const getInvoiceDetails = async (req: Request, res: Response) => {
       // 1. Fetch Auth User info (for email and metadata)
       const { data: userData } = await supabaseAdmin.auth.admin.getUserById(userId);
       const user = userData?.user;
-      
+
       if (user) {
         customerEmail = user.email || 'N/A';
-        
+
         // 2. Fetch Profile (Sidebar style)
         const { data: profile } = await supabaseAdmin
           .from('profiles')
@@ -519,11 +656,11 @@ export const getInvoiceDetails = async (req: Request, res: Response) => {
           .maybeSingle();
 
         // 3. Name Priority: Profile > User Metadata > Email Prefix
-        customerName = profile?.full_name || 
-                       user.user_metadata?.full_name || 
-                       user.user_metadata?.name || 
-                       user.email?.split('@')[0] || 
-                       'Valued Customer';
+        customerName = profile?.full_name ||
+          user.user_metadata?.full_name ||
+          user.user_metadata?.name ||
+          user.email?.split('@')[0] ||
+          'Valued Customer';
       }
     }
 
@@ -664,7 +801,7 @@ export const getSubscriptionHistory = async (req: Request, res: Response) => {
 
 export const createExtensionOrder = async (req: Request, res: Response) => {
   try {
-    const { userId, type, quantity, subscriptionId } = req.body;
+    const { userId, type, quantity, subscriptionId, couponCode } = req.body;
 
     if (!userId || !type || !quantity || !subscriptionId) {
       return res.status(400).json({ error: 'Missing required parameters' });
@@ -710,7 +847,70 @@ export const createExtensionOrder = async (req: Request, res: Response) => {
     // Human-friendly pro-rating: 100% on Day 1, then drops daily.
     const durationRatio = Math.max(0, Math.min(1, (totalDays - daysPassed) / totalDays));
 
-    const amountTotal = Math.max(1, Math.round(((quantity / pricing.unit_quantity) * pricing.unit_price) * durationRatio));
+    const itemBaseTotal = (quantity / pricing.unit_quantity) * pricing.unit_price;
+    const proRatedBaseTotal = itemBaseTotal * durationRatio;
+
+    // --- COUPON VALIDATION (Extensions) ---
+    let couponDiscount = 0;
+    let couponId = null;
+
+    if (couponCode) {
+      // 1. Fetch Coupon Data
+      const { data: coupon, error: couponError } = await supabaseAdmin
+        .from('coupons')
+        .select('*')
+        .eq('code', couponCode.trim().toUpperCase())
+        .eq('is_active', true)
+        .eq('is_applicable_to_extensions', true)
+        .single();
+
+      if (couponError || !coupon) {
+        return res.status(400).json({ error: 'Invalid coupon or coupon not applicable to extensions' });
+      }
+
+      // 2. Check Expiry
+      if (coupon.expiry_date && new Date(coupon.expiry_date) < new Date()) {
+        return res.status(400).json({ error: 'This coupon has expired' });
+      }
+
+      // 3. Check Minimum Purchase
+      if (Math.round(proRatedBaseTotal) < coupon.min_purchase_amount) {
+        return res.status(400).json({ error: `Minimum purchase amount not met (Min: ₹${coupon.min_purchase_amount})` });
+      }
+
+      // 4. Check Usage Limits
+      const { count: totalUsageCount } = await supabaseAdmin
+        .from('coupon_usage')
+        .select('*', { count: 'exact', head: true })
+        .eq('coupon_id', coupon.id);
+
+      if (coupon.total_usage_limit !== null && (totalUsageCount || 0) >= coupon.total_usage_limit) {
+        return res.status(400).json({ error: 'This coupon usage limit has been reached' });
+      }
+
+      const { count: userUsageCount } = await supabaseAdmin
+        .from('coupon_usage')
+        .select('*', { count: 'exact', head: true })
+        .eq('coupon_id', coupon.id)
+        .eq('user_id', userId);
+
+      if ((userUsageCount || 0) >= coupon.user_usage_limit) {
+        return res.status(400).json({ error: 'You have already used this coupon' });
+      }
+
+      // 5. Calculate Discount
+      if (coupon.discount_type === 'FLAT') {
+        couponDiscount = coupon.discount_value;
+      } else {
+        couponDiscount = (proRatedBaseTotal * coupon.discount_value) / 100;
+        if (coupon.max_discount_amount && couponDiscount > coupon.max_discount_amount) {
+          couponDiscount = coupon.max_discount_amount;
+        }
+      }
+      couponId = coupon.id;
+    }
+
+    const amountTotal = Math.max(1, Math.round(proRatedBaseTotal - couponDiscount));
     const amountInPaise = Math.round(amountTotal * 100);
 
     // 3. Create Razorpay order
@@ -722,7 +922,9 @@ export const createExtensionOrder = async (req: Request, res: Response) => {
         userId,
         subscriptionId,
         extensionType: type,
-        quantity: quantity.toString()
+        quantity: quantity.toString(),
+        coupon_id: couponId,
+        coupon_discount: couponDiscount.toString()
       }
     };
 
@@ -739,10 +941,12 @@ export const createExtensionOrder = async (req: Request, res: Response) => {
         amount_total: amountTotal,
         amount_paid: amountTotal,
         razorpay_order_id: order.id,
-        metadata: { 
-          type: type, 
+        applied_coupon_id: couponId,
+        discount_amount: couponDiscount,
+        metadata: {
+          type: type,
           quantity: quantity,
-          isExtension: true 
+          isExtension: true
         }
       })
       .select('id')
@@ -804,8 +1008,8 @@ export const verifyExtensionPayment = async (req: Request, res: Response) => {
 
     // 3. Update Transaction with Unified Sequential Invoice (INV prefix)
     const extensionInvoice = await getNextInvoiceNumber('INV');
-    
-    const { error: txUpdateError } = await supabaseAdmin
+
+    const { data: txData, error: txUpdateError } = await supabaseAdmin
       .from('subscription_transactions')
       .update({
         status: 'success',
@@ -816,11 +1020,21 @@ export const verifyExtensionPayment = async (req: Request, res: Response) => {
         razorpay_tax: tax,
         invoice_number: extensionInvoice
       })
-      .eq('id', transactionId);
+      .eq('id', transactionId)
+      .select('applied_coupon_id, user_id')
+      .single();
 
     if (txUpdateError) {
       console.error("Critical: Failed to update transaction invoice_number", txUpdateError);
-      // We continue since the money was taken, but this explains the null invoice number
+    }
+
+    // Record Coupon Usage
+    if (txData?.applied_coupon_id) {
+      await supabaseAdmin.from('coupon_usage').insert({
+        coupon_id: txData.applied_coupon_id,
+        user_id: txData.user_id || req.body.userId,
+        transaction_id: transactionId
+      });
     }
 
     // 4. Fetch the existing subscription
