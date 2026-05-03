@@ -13,6 +13,7 @@ import paymentRoutes from './routes/paymentRoutes';
 import notificationRoutes from './routes/notificationRoutes';
 import contactRoutes from './routes/contactRoutes';
 import couponsRoutes from './routes/couponsRoutes';
+import reportsRoutes from './routes/reportsRoutes';
 import { subscriptionScheduler } from './services/subscriptionScheduler';
 
 const app = express();
@@ -30,6 +31,7 @@ app.use('/api/payments', paymentRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/coupons', couponsRoutes);
+app.use('/api/reports', reportsRoutes);
 
 app.get('/', (req, res) => {
   res.send('FitFlow Custom Backend API is running!');
