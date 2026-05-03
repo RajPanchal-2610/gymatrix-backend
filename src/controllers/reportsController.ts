@@ -217,7 +217,7 @@ export const getMembershipLifecycle = async (req: AuthenticatedRequest, res: Res
         newMembers?.forEach(m => {
             events.push({
                 member: m.full_name,
-                type: 'New Admission',
+                type: 'New Member',
                 date: m.created_at
             });
         });
@@ -265,11 +265,114 @@ export const getMembershipLifecycle = async (req: AuthenticatedRequest, res: Res
 
         res.status(200).json({
             summary: [
-                { name: 'New Admissions', count: stats.new },
+                { name: 'New Members', count: stats.new },
                 { name: 'Renewals', count: stats.renewals },
                 { name: 'Expiries', count: stats.expired }
             ],
             details: events
+        });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+// GET /api/reports/overview
+export const getReportsOverview = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        const gymId = req.gymId;
+        if (!gymId) return res.status(401).json({ error: 'Unauthorized' });
+
+        const now = new Date();
+        const startOfMonthDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+        const startOfLastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
+
+        // 1. Total Collection (Life-time)
+        const { data: collectionData, error: collError } = await supabaseAdmin
+            .from('gym_payment_transactions')
+            .select('amount')
+            .eq('gym_id', gymId);
+
+        if (collError) throw collError;
+        const totalCollection = collectionData?.reduce((acc, curr) => acc + Number(curr.amount), 0) || 0;
+
+        // 1b. This Month vs Last Month Collection
+        const { data: thisMonthCollData } = await supabaseAdmin
+            .from('gym_payment_transactions')
+            .select('amount')
+            .eq('gym_id', gymId)
+            .gte('paid_at', startOfMonthDate);
+
+        const { data: lastMonthCollData } = await supabaseAdmin
+            .from('gym_payment_transactions')
+            .select('amount')
+            .eq('gym_id', gymId)
+            .gte('paid_at', startOfLastMonthDate)
+            .lt('paid_at', startOfMonthDate);
+
+        const thisMonthCollection = thisMonthCollData?.reduce((acc, curr) => acc + Number(curr.amount), 0) || 0;
+        const lastMonthCollection = lastMonthCollData?.reduce((acc, curr) => acc + Number(curr.amount), 0) || 0;
+
+        let collectionTrend = 0;
+        if (lastMonthCollection > 0) {
+            collectionTrend = ((thisMonthCollection - lastMonthCollection) / lastMonthCollection) * 100;
+        } else if (thisMonthCollection > 0) {
+            collectionTrend = 100;
+        }
+
+        // 2. Active Members
+        const { count: activeCount, error: memberError } = await supabaseAdmin
+            .from('gym_members')
+            .select('*', { count: 'exact', head: true })
+            .eq('gym_id', gymId)
+            .eq('status', 'active')
+            .eq('is_deleted', false);
+
+        if (memberError) throw memberError;
+
+        // 3. Monthly Growth (New Members)
+        const { count: thisMonthNew, error: thisMonthError } = await supabaseAdmin
+            .from('gym_members')
+            .select('*', { count: 'exact', head: true })
+            .eq('gym_id', gymId)
+            .gte('created_at', startOfMonthDate)
+            .eq('is_deleted', false);
+
+        const { count: lastMonthNew, error: lastMonthError } = await supabaseAdmin
+            .from('gym_members')
+            .select('*', { count: 'exact', head: true })
+            .eq('gym_id', gymId)
+            .gte('created_at', startOfLastMonthDate)
+            .lt('created_at', startOfMonthDate)
+            .eq('is_deleted', false);
+
+        if (thisMonthError || lastMonthError) throw (thisMonthError || lastMonthError);
+
+        // 4. Retention Rate (Active / Total)
+        const { count: totalMembers } = await supabaseAdmin
+            .from('gym_members')
+            .select('*', { count: 'exact', head: true })
+            .eq('gym_id', gymId)
+            .eq('is_deleted', false);
+
+        let retention = 0;
+        if (totalMembers && totalMembers > 0) {
+            retention = ((activeCount || 0) / totalMembers) * 100;
+        }
+
+        let growth = 0;
+        if (lastMonthNew && lastMonthNew > 0) {
+            growth = (( (thisMonthNew || 0) - lastMonthNew) / lastMonthNew) * 100;
+        } else if (thisMonthNew && thisMonthNew > 0) {
+            growth = 100; // 100% growth if we had 0 last month
+        }
+
+        res.status(200).json({
+            totalCollection,
+            thisMonthCollection,
+            collectionTrend: collectionTrend.toFixed(1),
+            activeMembers: activeCount || 0,
+            growth: growth.toFixed(1),
+            retention: retention.toFixed(1)
         });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
