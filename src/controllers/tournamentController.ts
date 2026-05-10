@@ -287,15 +287,15 @@ export const getTournamentById = async (req: AuthenticatedRequest, res: Response
         let attempts = null;
         let leaderboard = null;
 
-        if (formatType === 'KNOCKOUT') {
+        if (formatType === 'KNOCKOUT' || tournament.format?.name === 'Group Stage + Knockout') {
             // Get matches for bracket view
             const { data: matchData, error: matchError } = await supabaseAdmin
                 .from('gym_tournament_matches')
                 .select(`
                     *,
-                    participant1:participant1_id(id, member:member_id(id, full_name)),
-                    participant2:participant2_id(id, member:member_id(id, full_name)),
-                    winner:winner_id(id, member:member_id(id, full_name))
+                    participant1:participant1_id(id, external_name, member:member_id(id, full_name)),
+                    participant2:participant2_id(id, external_name, member:member_id(id, full_name)),
+                    winner:winner_id(id, external_name, member:member_id(id, full_name))
                 `)
                 .eq('tournament_id', id)
                 .order('round_number', { ascending: true })
@@ -309,7 +309,7 @@ export const getTournamentById = async (req: AuthenticatedRequest, res: Response
                 .from('gym_tournament_attempts')
                 .select(`
                     *,
-                    participant:participant_id(id, member:member_id(id, full_name))
+                    participant:participant_id(id, external_name, member:member_id(id, full_name))
                 `)
                 .eq('tournament_id', id)
                 .order('participant_id')
@@ -390,17 +390,7 @@ export const deleteTournament = async (req: AuthenticatedRequest, res: Response)
     try {
         const { id } = req.params;
 
-        // Check status
-        const { data: tournament } = await supabaseAdmin
-            .from('gym_tournaments')
-            .select('status')
-            .eq('id', id)
-            .single();
-
-        if (tournament && !['DRAFT', 'CANCELLED'].includes(tournament.status)) {
-            return res.status(400).json({ error: 'Can only delete DRAFT or CANCELLED tournaments' });
-        }
-
+        // No status check - allow deleting any tournament as requested
         const { error } = await supabaseAdmin
             .from('gym_tournaments')
             .delete()
@@ -426,10 +416,10 @@ export const deleteTournament = async (req: AuthenticatedRequest, res: Response)
 export const addParticipants = async (req: AuthenticatedRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const { member_ids } = req.body;
+        const { member_ids, external_participants } = req.body;
 
-        if (!member_ids || !Array.isArray(member_ids) || member_ids.length === 0) {
-            return res.status(400).json({ error: 'member_ids array is required' });
+        if ((!member_ids || member_ids.length === 0) && (!external_participants || external_participants.length === 0)) {
+            return res.status(400).json({ error: 'At least one participant (member or external) is required' });
         }
 
         // Verify tournament exists and is in DRAFT status
@@ -444,22 +434,55 @@ export const addParticipants = async (req: AuthenticatedRequest, res: Response) 
             return res.status(400).json({ error: 'Can only add participants to DRAFT tournaments' });
         }
 
-        // Build participant rows with seed numbers
-        const participants = member_ids.map((memberId: number, index: number) => ({
-            tournament_id: id,
-            member_id: memberId,
-            seed_number: index + 1,
-        }));
+        // Fetch current highest seed number to continue sequence
+        const { data: currentParticipants } = await supabaseAdmin
+            .from('gym_tournament_participants')
+            .select('seed_number')
+            .eq('tournament_id', id)
+            .order('seed_number', { ascending: false })
+            .limit(1);
+        
+        let nextSeed = (currentParticipants?.[0]?.seed_number || 0) + 1;
+
+        const participantRows: any[] = [];
+
+        // 1. Add Gym Members
+        if (member_ids && Array.isArray(member_ids)) {
+            member_ids.forEach(mId => {
+                participantRows.push({
+                    tournament_id: id,
+                    member_id: mId,
+                    seed_number: nextSeed++,
+                });
+            });
+        }
+
+        // 2. Add External Participants
+        if (external_participants && Array.isArray(external_participants)) {
+            external_participants.forEach(ext => {
+                participantRows.push({
+                    tournament_id: id,
+                    external_name: ext.name,
+                    external_contact: ext.contact || null,
+                    seed_number: nextSeed++,
+                });
+            });
+        }
 
         const { data, error } = await supabaseAdmin
             .from('gym_tournament_participants')
-            .upsert(participants, { onConflict: 'tournament_id,member_id' })
+            .insert(participantRows)
             .select(`
                 *,
                 member:member_id(id, full_name, phone, email)
             `);
 
-        if (error) throw error;
+        if (error) {
+            if (error.code === '23505') {
+                return res.status(400).json({ error: 'One or more participants are already registered for this tournament' });
+            }
+            throw error;
+        }
 
         res.status(201).json(data);
     } catch (error: any) {
@@ -566,11 +589,14 @@ export const generateStructure = async (req: AuthenticatedRequest, res: Response
             }
         }
 
+        const formatName = (tournament.format as any)?.name;
         const formatType = (tournament.format as any)?.type;
 
         let result;
 
-        if (formatType === 'KNOCKOUT') {
+        if (formatName === 'Group Stage + Knockout') {
+            result = await tournamentService.generateMultiStageStructure(id, participantIds);
+        } else if (formatType === 'KNOCKOUT') {
             result = await tournamentService.generateKnockoutBracket(id, participantIds);
         } else {
             // Score-Based or Time-Based
@@ -591,6 +617,56 @@ export const generateStructure = async (req: AuthenticatedRequest, res: Response
     } catch (error: any) {
         console.error('Generate structure error:', error);
         res.status(500).json({ error: error.message || 'Failed to generate tournament structure' });
+    }
+};
+
+export const advanceTournamentPhase = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        const result = await tournamentService.advanceToKnockout(id);
+        
+        if (result.tieDetected) {
+            return res.json({ 
+                message: 'Tie detected', 
+                tieDetected: true, 
+                groupLabel: result.groupLabel,
+                tiedPlayers: result.tiedPlayers,
+                playersToAdvance: result.playersToAdvance
+            });
+        }
+
+        res.json({ message: 'Knockout bracket generated successfully', result: result.bracket });
+    } catch (error: any) {
+        console.error('Advance tournament error:', error);
+        res.status(500).json({ error: error.message || 'Failed to advance tournament' });
+    }
+};
+
+/**
+ * POST /api/tournaments/:id/resolve-tie
+ * Generates tie-breaker matches for a specific group.
+ * Body: { groupLabel, participantIds, strategy }
+ */
+export const resolveTieBreaker = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { groupLabel, participantIds, strategy } = req.body;
+
+        if (!groupLabel || !participantIds || !strategy) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        const matches = await tournamentService.generateTieBreakerMatches(
+            id,
+            groupLabel,
+            participantIds,
+            strategy
+        );
+
+        res.json({ message: 'Tie-breaker matches generated', matches });
+    } catch (error: any) {
+        console.error('Resolve tie-breaker error:', error);
+        res.status(500).json({ error: error.message || 'Failed to resolve tie-breaker' });
     }
 };
 

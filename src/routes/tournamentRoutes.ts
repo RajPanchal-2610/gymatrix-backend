@@ -31,6 +31,8 @@ router.delete('/:id/participants/:participantId', authenticate, tournamentContro
 // Structure Generation & Results
 // =========================================
 router.post('/:id/generate', authenticate, tournamentController.generateStructure);
+router.post('/:id/advance', authenticate, tournamentController.advanceTournamentPhase);
+router.post('/:id/resolve-tie', authenticate, tournamentController.resolveTieBreaker);
 router.post('/:id/matches/:matchId/result', authenticate, tournamentController.submitMatchResult);
 router.patch('/:id/attempts/:attemptId', authenticate, tournamentController.updateAttempt);
 
