@@ -242,7 +242,7 @@ export async function generateMultiStageStructure(
     participantIds: string[]
 ) {
     // Shuffling participants for fair, randomized group placement
-    const shuffledIds = [...participantIds].sort(() => Math.random() - 0.5);
+    const shuffledIds = [...participantIds];
     const totalParticipants = shuffledIds.length;
 
     // 0. Fetch group size from tournament rules
@@ -419,18 +419,21 @@ export async function calculateLeaderboard(tournamentId: string) {
 
     if (aError) throw aError;
 
+    const winningCriteria = (tournament.rules as any)?.winning_criteria || (formatType === 'TIME_BASED' ? 'lowest' : 'highest');
+
     // Group attempts by participant
     const participantBest = new Map<string, { participantId: string; memberName: string; bestScore: number; attempts: any[] }>();
 
     for (const attempt of attempts || []) {
         const pid = attempt.participant_id;
         const memberName = (attempt.participant as any)?.external_name || (attempt.participant as any)?.member?.full_name || 'Unknown';
+        const score = attempt.score ?? (winningCriteria === 'lowest' ? Infinity : 0);
 
         if (!participantBest.has(pid)) {
             participantBest.set(pid, {
                 participantId: pid,
                 memberName,
-                bestScore: attempt.score ?? 0,
+                bestScore: score,
                 attempts: [],
             });
         }
@@ -442,27 +445,29 @@ export async function calculateLeaderboard(tournamentId: string) {
             status: attempt.status,
         });
 
-        // Update best score
-        if (formatType === 'TIME_BASED') {
-            // For time-based: higher duration = better (e.g., plank hold)
-            // The rules.measurement field can control this, but default is "longest wins"
-            if ((attempt.score ?? 0) > entry.bestScore) {
-                entry.bestScore = attempt.score ?? 0;
+        // Update best score based on criteria
+        if (winningCriteria === 'lowest') {
+            if (score < entry.bestScore) {
+                entry.bestScore = score;
             }
         } else {
-            // Score-based: highest value wins
-            if ((attempt.score ?? 0) > entry.bestScore) {
-                entry.bestScore = attempt.score ?? 0;
+            if (score > entry.bestScore) {
+                entry.bestScore = score;
             }
         }
     }
 
-    // Sort by best score descending (highest first for both score and time-based by default)
+    // Sort by best score (ascending for lowest-wins, descending for highest-wins)
     const leaderboard = Array.from(participantBest.values())
-        .sort((a, b) => b.bestScore - a.bestScore)
+        .sort((a, b) => {
+            if (winningCriteria === 'lowest') return a.bestScore - b.bestScore;
+            return b.bestScore - a.bestScore;
+        })
         .map((entry, index) => ({
             rank: index + 1,
             ...entry,
+            // Clean up Infinity if no scores were recorded
+            bestScore: entry.bestScore === Infinity ? 0 : entry.bestScore
         }));
 
     return leaderboard;
@@ -525,35 +530,118 @@ export async function recordMatchResult(
  * If ties are detected that prevent determining the top players, returns tie details.
  */
 export async function advanceToKnockout(tournamentId: string) {
-    // 1. Get all group stage matches and participants
+    // 0. Get tournament format to know if high score or low time is better
+    const { data: tournament } = await supabaseAdmin
+        .from('gym_tournaments')
+        .select('format:format_id(type)')
+        .eq('id', tournamentId)
+        .single();
+
+    const isTimeBased = (tournament?.format as any)?.type === 'TIME_BASED';
+
+    // 1. Get all matches for the tournament
     const { data: matches, error: mError } = await supabaseAdmin
         .from('gym_tournament_matches')
         .select(`
             *,
-            participant1:participant1_id(id, external_name, member:member_id(id, full_name)),
-            participant2:participant2_id(id, external_name, member:member_id(id, full_name))
+            participant1:participant1_id(id, external_name, member:member_id(full_name)),
+            participant2:participant2_id(id, external_name, member:member_id(full_name))
         `)
-        .eq('tournament_id', tournamentId)
-        .in('phase', ['GROUP', 'TIE_BREAKER']);
+        .eq('tournament_id', tournamentId);
 
     if (mError) throw mError;
+    if (!matches) return { success: false, error: 'No matches found' };
 
-    // 2. Calculate wins per participant in each group
-    const standings = new Map<string, { [participantId: string]: { wins: number; name: string } }>();
-    matches.forEach(m => {
-        if (m.winner_id && m.group_label) {
-            const group = m.group_label;
-            if (!standings.has(group)) standings.set(group, {});
-            const groupStandings = standings.get(group)!;
-            
-            if (!groupStandings[m.winner_id]) {
-                const p = m.participant1_id === m.winner_id ? m.participant1 : m.participant2;
-                groupStandings[m.winner_id] = { 
-                    wins: 0, 
-                    name: (p as any)?.external_name || (p as any)?.member?.full_name || 'Unknown' 
+    // 2. Calculate wins, total score, and tie-breaker priority per participant
+    const standings = new Map<string, { [participantId: string]: { wins: number; name: string; total_score: number; tie_breaker_score: number; played_tie_breaker: boolean } }>();
+    matches.forEach((m: any) => {
+        const group = m.group_label;
+        if (!group) return;
+        if (!standings.has(group)) standings.set(group, {});
+        const groupStandings = standings.get(group)!;
+
+        // Ensure all participants in the match are in the map
+        [m.participant1_id, m.participant2_id].forEach(pid => {
+            if (pid && !groupStandings[pid]) {
+                const p = m.participant1_id === pid ? m.participant1 : m.participant2;
+                groupStandings[pid] = {
+                    wins: 0,
+                    name: (p as any)?.external_name || (p as any)?.member?.full_name || 'Unknown',
+                    total_score: 0,
+                    tie_breaker_score: 0,
+                    played_tie_breaker: false
                 };
             }
+        });
+
+        // Add scores to totals (if they exist)
+        if (m.participant1_id && m.participant1_score !== null) {
+            groupStandings[m.participant1_id].total_score += Number(m.participant1_score);
+        }
+        if (m.participant2_id && m.participant2_score !== null) {
+            groupStandings[m.participant2_id].total_score += Number(m.participant2_score);
+        }
+
+        if (m.phase === 'TIE_BREAKER') {
+            if (m.participant1_id) groupStandings[m.participant1_id].played_tie_breaker = true;
+            if (m.participant2_id) groupStandings[m.participant2_id].played_tie_breaker = true;
+        }
+
+        if (m.winner_id && m.status === 'COMPLETED') {
             groupStandings[m.winner_id].wins += 1;
+        }
+
+        if (m.phase === 'TIE_BREAKER' && m.status === 'COMPLETED') {
+            const roundMatches = matches.filter(other => 
+                other.phase === 'TIE_BREAKER' && 
+                other.group_label === m.group_label &&
+                other.round_number === m.round_number
+            );
+            
+            // A Mini League has no linked matches. A Stepladder always has links 
+            // (unless it's a 1-match tiebreaker, which functions properly as Stepladder anyway).
+            const hasNextMatch = roundMatches.some(other => other.next_match_id !== null);
+            const isMiniLeague = roundMatches.length > 1 && !hasNextMatch;
+            const isStepladder = !isMiniLeague;
+
+            if (isStepladder) {
+                if (m.winner_id && groupStandings[m.winner_id]) {
+                    groupStandings[m.winner_id].tie_breaker_score += (m.match_number * 10);
+                }
+                const loserId = m.winner_id === m.participant1_id ? m.participant2_id : m.participant1_id;
+                if (loserId && groupStandings[loserId]) {
+                    groupStandings[loserId].tie_breaker_score += m.match_number;
+                }
+            }
+        }
+    });
+
+    // 2.5 Handle "Safe" players who were in the tie but didn't have to play in the LATEST round
+    // They should be ranked above losers but below winners of tie-breaker matches in that specific round.
+    standings.forEach((groupStandings, label) => {
+        // Find the latest tie-breaker round for this group
+        const latestRound = matches.reduce((max, m) => 
+            (m.phase === 'TIE_BREAKER' && m.group_label === label) ? Math.max(max, m.round_number) : max, 
+            0
+        );
+
+        if (latestRound > 0) {
+            Object.keys(groupStandings).forEach(pid => {
+                const p = groupStandings[pid];
+                // Check if they played in the LATEST round specifically
+                const playedInLatest = matches.some(m => 
+                    m.phase === 'TIE_BREAKER' && 
+                    m.group_label === label && 
+                    m.round_number === latestRound &&
+                    (m.participant1_id === pid || m.participant2_id === pid)
+                );
+
+                if (!playedInLatest) {
+                    // Only give safe points to people who WERE tied (wins/score equal to the top players)
+                    // but didn't play in the latest round.
+                    p.tie_breaker_score = 5; 
+                }
+            });
         }
     });
 
@@ -570,26 +658,55 @@ export async function advanceToKnockout(tournamentId: string) {
     for (const label of groupLabels) {
         const groupStandings = standings.get(label)!;
         const sortedEntries = Object.entries(groupStandings)
-            .sort(([, a], [, b]) => b.wins - a.wins);
+            .sort(([, a], [, b]) => {
+                // 1. Primary: Total Wins (Highest first)
+                if (b.wins !== a.wins) return b.wins - a.wins;
+
+                // 2. Secondary: Total Score (Format dependent)
+                if (a.total_score !== b.total_score) {
+                    return isTimeBased
+                        ? a.total_score - b.total_score // Lower time is better
+                        : b.total_score - a.total_score; // Higher reps/weight is better
+                }
+
+                // 3. Tertiary: Tie-breaker score (from manual tie-breaker matches)
+                return b.tie_breaker_score - a.tie_breaker_score;
+            });
 
         // Check for tie at the cutoff point
-        // If we need 2, and 2nd and 3rd have same wins, it's a tie
         if (sortedEntries.length > playersToAdvance) {
-            const lastAdvancingWins = sortedEntries[playersToAdvance - 1][1].wins;
-            const firstExcludedWins = sortedEntries[playersToAdvance][1].wins;
+            const lastAdvancing = sortedEntries[playersToAdvance - 1][1];
+            const firstExcluded = sortedEntries[playersToAdvance][1];
 
-            if (lastAdvancingWins === firstExcludedWins) {
-                // Find all players tied with the cutoff
+            // A tie only exists if ALL metrics are identical
+            const isTie = lastAdvancing.wins === firstExcluded.wins &&
+                lastAdvancing.total_score === firstExcluded.total_score &&
+                lastAdvancing.tie_breaker_score === firstExcluded.tie_breaker_score;
+
+            if (isTie) {
+                // Find all players tied with the cutoff based on all metrics
                 const tiedPlayers = sortedEntries
-                    .filter(([, p]) => p.wins === lastAdvancingWins)
+                    .filter(([, p]) =>
+                        p.wins === lastAdvancing.wins &&
+                        p.total_score === lastAdvancing.total_score &&
+                        p.tie_breaker_score === lastAdvancing.tie_breaker_score
+                    )
                     .map(([id, p]) => ({ id, name: p.name }));
-                
-                // If it's a 3-way tie (or more) that affects the top positions
+
+                // Calculate how many spots the tied players are fighting for
+                const firstTiedIndex = sortedEntries.findIndex(([, p]) => 
+                    p.wins === lastAdvancing.wins &&
+                    p.total_score === lastAdvancing.total_score &&
+                    p.tie_breaker_score === lastAdvancing.tie_breaker_score
+                );
+                const spotsAvailable = playersToAdvance - firstTiedIndex;
+
                 return {
                     tieDetected: true,
                     groupLabel: label,
                     tiedPlayers,
-                    playersToAdvance
+                    playersToAdvance,
+                    spotsAvailable
                 };
             }
         }
@@ -614,10 +731,12 @@ export async function generateTieBreakerMatches(
     tournamentId: string,
     groupLabel: string,
     participantIds: string[],
-    strategy: 'STEPLADDER' | 'MINI_LEAGUE'
+    strategy: 'STEPLADDER' | 'MINI_LEAGUE',
+    safeParticipantId?: string,
+    spotsAvailable: number = 1
 ) {
     const matches: any[] = [];
-    
+
     // 1. Find the next round number for tie-breakers in this group
     const { data: existingMatches } = await supabaseAdmin
         .from('gym_tournament_matches')
@@ -631,49 +750,75 @@ export async function generateTieBreakerMatches(
     const nextRound = (existingMatches?.[0]?.round_number || 0) + 1;
 
     if (strategy === 'STEPLADDER') {
-        // Randomly pick 2 to play first
         const shuffled = [...participantIds].sort(() => Math.random() - 0.5);
-        const p1 = shuffled[0];
-        const p2 = shuffled[1];
-        const p3 = shuffled[2]; // The 3rd player who waits
+        const spots = Math.max(1, spotsAvailable);
+        const pools: string[][] = Array.from({ length: spots }, () => []);
 
-        // 2. Create Match 2 first (The Final Tie-Breaker Match)
-        const { data: m2, error: e2 } = await supabaseAdmin
-            .from('gym_tournament_matches')
-            .insert({
-                tournament_id: tournamentId,
-                phase: 'TIE_BREAKER',
-                group_label: groupLabel,
-                round_number: nextRound,
-                match_number: 2,
-                participant2_id: p3, // P3 waits in the second slot
-                status: 'PENDING'
-            })
-            .select()
-            .single();
+        let playersToDistribute = [...shuffled];
 
-        if (e2) throw e2;
+        // If exactly 1 safe player is selected and we have 2 spots,
+        // we can force them into a pool by themselves so they get a BYE.
+        if (spots === 2 && safeParticipantId && participantIds.includes(safeParticipantId)) {
+            pools[0].push(safeParticipantId);
+            playersToDistribute = playersToDistribute.filter(id => id !== safeParticipantId);
+            playersToDistribute.forEach(id => pools[1].push(id));
+        } else {
+            // Distribute players evenly into the available spot pools
+            for (let i = 0; i < playersToDistribute.length; i++) {
+                pools[i % spots].push(playersToDistribute[i]);
+            }
+        }
 
-        // 3. Create Match 1 and link to Match 2
-        const { data: m1, error: e1 } = await supabaseAdmin
-            .from('gym_tournament_matches')
-            .insert({
-                tournament_id: tournamentId,
-                phase: 'TIE_BREAKER',
-                group_label: groupLabel,
-                round_number: nextRound,
-                match_number: 1,
-                participant1_id: p1,
-                participant2_id: p2,
-                next_match_id: m2.id,
-                status: 'PENDING'
-            })
-            .select()
-            .single();
+        let currentMatchNumber = 1;
 
-        if (e1) throw e1;
-        
-        return [m1, m2];
+        for (const pool of pools) {
+            if (pool.length < 2) continue; // No matches needed for a pool of 1 (automatic BYE)
+
+            const poolMatches = [];
+            // For N players, we need N-1 matches to find 1 winner
+            for (let i = 0; i < pool.length - 1; i++) {
+                const isFirstMatch = i === 0;
+                
+                poolMatches.push({
+                    tournament_id: tournamentId,
+                    phase: 'TIE_BREAKER',
+                    group_label: groupLabel,
+                    round_number: nextRound,
+                    match_number: currentMatchNumber++,
+                    participant1_id: isFirstMatch ? pool[0] : null,
+                    participant2_id: pool[i + 1],
+                    next_match_id: null,
+                    status: 'PENDING'
+                });
+            }
+
+            // Insert matches for this pool
+            const { data: inserted, error } = await supabaseAdmin
+                .from('gym_tournament_matches')
+                .insert(poolMatches)
+                .select()
+                .order('match_number', { ascending: true });
+
+            if (error) throw error;
+
+            // Link the matches together (Match 1 winner goes to Match 2, etc.)
+            if (inserted && inserted.length > 1) {
+                for (let i = 0; i < inserted.length - 1; i++) {
+                    await supabaseAdmin
+                        .from('gym_tournament_matches')
+                        .update({ next_match_id: inserted[i + 1].id })
+                        .eq('id', inserted[i].id);
+                    
+                    inserted[i].next_match_id = inserted[i + 1].id;
+                }
+            }
+            
+            if (inserted) {
+                matches.push(...inserted);
+            }
+        }
+
+        return matches;
     } else {
         // MINI_LEAGUE: A vs B, B vs C, C vs A
         for (let i = 0; i < participantIds.length; i++) {

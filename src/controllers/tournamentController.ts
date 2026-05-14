@@ -220,6 +220,7 @@ export const getTournaments = async (req: AuthenticatedRequest, res: Response) =
                 *,
                 category:category_id(id, name),
                 format:format_id(id, name, type),
+                winner:gym_tournament_participants!fk_tournament_winner(id, external_name, member:member_id(id, full_name)),
                 participants:gym_tournament_participants!gym_tournament_participants_tournament_id_fkey(count)
             `)
             .order('created_at', { ascending: false });
@@ -262,7 +263,8 @@ export const getTournamentById = async (req: AuthenticatedRequest, res: Response
             .select(`
                 *,
                 category:category_id(id, name, description),
-                format:format_id(id, name, type)
+                format:format_id(id, name, type),
+                winner:gym_tournament_participants!fk_tournament_winner(id, external_name, member:member_id(id, full_name))
             `)
             .eq('id', id)
             .single();
@@ -309,10 +311,10 @@ export const getTournamentById = async (req: AuthenticatedRequest, res: Response
                 .from('gym_tournament_attempts')
                 .select(`
                     *,
-                    participant:participant_id(id, external_name, member:member_id(id, full_name))
+                    participant:participant_id(id, external_name, seed_number, member:member_id(id, full_name))
                 `)
                 .eq('tournament_id', id)
-                .order('participant_id')
+                .order('seed_number', { foreignTable: 'participant', ascending: true })
                 .order('attempt_number', { ascending: true });
 
             if (attemptError) throw attemptError;
@@ -576,18 +578,19 @@ export const generateStructure = async (req: AuthenticatedRequest, res: Response
             }
         } else if (seedingStrategy === 'MANUAL' && Array.isArray(orderedParticipantIds)) {
             // Use the provided manual ordering if it matches the current participants
-            if (orderedParticipantIds.length === participantIds.length && orderedParticipantIds.every(id => participantIds.includes(id))) {
+            if (orderedParticipantIds.length === participantIds.length && orderedParticipantIds.every(pid => participantIds.includes(pid))) {
                 participantIds = orderedParticipantIds;
-                
-                // Update seed numbers in DB to reflect the new order
-                const updates = orderedParticipantIds.map((id, index) => ({
-                    id,
-                    tournament_id: id, // Actually upsert needs tournament_id to satisfy unique constraints
-                    seed_number: index + 1
-                }));
-                // Just let the backend use the array order for generation
             }
         }
+
+        // ALWAYS update seed numbers in DB to reflect the final order (Random or Manual)
+        // This ensures the Results tab follows the sequence set at start time
+        const updates = participantIds.map((pid, index) => ({
+            id: pid,
+            tournament_id: id,
+            seed_number: index + 1
+        }));
+        await supabaseAdmin.from('gym_tournament_participants').upsert(updates);
 
         const formatName = (tournament.format as any)?.name;
         const formatType = (tournament.format as any)?.type;
@@ -631,7 +634,8 @@ export const advanceTournamentPhase = async (req: AuthenticatedRequest, res: Res
                 tieDetected: true, 
                 groupLabel: result.groupLabel,
                 tiedPlayers: result.tiedPlayers,
-                playersToAdvance: result.playersToAdvance
+                playersToAdvance: result.playersToAdvance,
+                spotsAvailable: result.spotsAvailable
             });
         }
 
@@ -650,7 +654,7 @@ export const advanceTournamentPhase = async (req: AuthenticatedRequest, res: Res
 export const resolveTieBreaker = async (req: AuthenticatedRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const { groupLabel, participantIds, strategy } = req.body;
+        const { groupLabel, participantIds, strategy, safeParticipantId, spotsAvailable } = req.body;
 
         if (!groupLabel || !participantIds || !strategy) {
             return res.status(400).json({ error: 'Missing required fields' });
@@ -660,7 +664,9 @@ export const resolveTieBreaker = async (req: AuthenticatedRequest, res: Response
             id,
             groupLabel,
             participantIds,
-            strategy
+            strategy,
+            safeParticipantId,
+            spotsAvailable
         );
 
         res.json({ message: 'Tie-breaker matches generated', matches });
