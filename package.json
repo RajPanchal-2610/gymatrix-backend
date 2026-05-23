@@ -1,7 +1,7 @@
 {
-  "name": "fittflow-backend",
+  "name": "gymatrix-backend",
   "version": "1.0.0",
-  "description": "Backend for FittFlow Gym Management via Supabase Service Role Key",
+  "description": "Backend for Gymatrix Gym Management via Supabase Service Role Key",
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",

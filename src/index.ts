@@ -36,7 +36,7 @@ app.use('/api/reports', reportsRoutes);
 app.use('/api/tournaments', tournamentRoutes);
 
 app.get('/', (req, res) => {
-  res.send('FitFlow Custom Backend API is running!');
+  res.send('Gymatrix Custom Backend API is running!');
 });
 
 app.listen(port, () => {

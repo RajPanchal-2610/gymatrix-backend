@@ -69,7 +69,7 @@ class EmailService {
   ): Promise<boolean> {
     const subject = `⚠️ Your ${planName} Trial Expires in 3 Days!`;
     const html = this.getTrialExpiryEmailTemplate(userName, planName, expiryDate);
-    const text = `Hi ${userName},\n\nYour ${planName} trial will expire in 3 days on ${expiryDate}.\n\nUpgrade now to continue enjoying all features without interruption.\n\nBest regards,\nFitFlow Team`;
+    const text = `Hi ${userName},\n\nYour ${planName} trial will expire in 3 days on ${expiryDate}.\n\nUpgrade now to continue enjoying all features without interruption.\n\nBest regards,\nGymatrix Team`;
 
     return this.sendEmail({ to, subject, html, text });
   }
@@ -82,7 +82,7 @@ class EmailService {
   ): Promise<boolean> {
     const subject = `🔔 Your ${planName} Subscription Ends in 3 Days`;
     const html = this.getSubscriptionRenewalEmailTemplate(userName, planName, expiryDate);
-    const text = `Hi ${userName},\n\nYour ${planName} subscription will end in 3 days on ${expiryDate}.\n\nRenew your subscription to continue enjoying all features without interruption.\n\nBest regards,\nFitFlow Team`;
+    const text = `Hi ${userName},\n\nYour ${planName} subscription will end in 3 days on ${expiryDate}.\n\nRenew your subscription to continue enjoying all features without interruption.\n\nBest regards,\nGymatrix Team`;
 
     return this.sendEmail({ to, subject, html, text });
   }
@@ -116,7 +116,7 @@ class EmailService {
                         </td>
                       </tr>
                     </table>
-                    <h1 style="margin: 0; color: #ffffff; font-size: 32px; font-weight: 800; letter-spacing: -0.5px;">Fit<span style="color: #e0f2fe;">Flow</span></h1>
+                    <h1 style="margin: 0; color: #ffffff; font-size: 32px; font-weight: 800; letter-spacing: -0.5px;">Gy<span style="color: #e0f2fe;">matrix</span></h1>
                     <p style="margin: 8px 0 0 0; color: #e0f2fe; font-size: 14px; font-weight: 500;">Gym Management Platform</p>
                   </td>
                 </tr>
@@ -169,10 +169,10 @@ class EmailService {
                 <tr>
                   <td style="background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); padding: 30px; text-align: center; border-top: 1px solid rgba(0,0,0,0.05);">
                     <p style="margin: 0 0 10px 0; color: #64748b; font-size: 12px; line-height: 1.6;">
-                      This is an automated message from FitFlow Gym Management Platform.
+                      This is an automated message from Gymatrix Gym Management Platform.
                     </p>
                     <p style="margin: 0; color: #94a3b8; font-size: 12px;">
-                      © ${new Date().getFullYear()} FitFlow. All rights reserved.
+                      © ${new Date().getFullYear()} Gymatrix. All rights reserved.
                     </p>
                   </td>
                 </tr>
@@ -215,7 +215,7 @@ class EmailService {
                         </td>
                       </tr>
                     </table>
-                    <h1 style="margin: 0; color: #ffffff; font-size: 32px; font-weight: 800; letter-spacing: -0.5px;">Fit<span style="color: #e0f2fe;">Flow</span></h1>
+                    <h1 style="margin: 0; color: #ffffff; font-size: 32px; font-weight: 800; letter-spacing: -0.5px;">Gy<span style="color: #e0f2fe;">matrix</span></h1>
                     <p style="margin: 8px 0 0 0; color: #e0f2fe; font-size: 14px; font-weight: 500;">Gym Management Platform</p>
                   </td>
                 </tr>
@@ -268,10 +268,10 @@ class EmailService {
                 <tr>
                   <td style="background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); padding: 30px; text-align: center; border-top: 1px solid rgba(0,0,0,0.05);">
                     <p style="margin: 0 0 10px 0; color: #64748b; font-size: 12px; line-height: 1.6;">
-                      This is an automated message from FitFlow Gym Management Platform.
+                      This is an automated message from Gymatrix Gym Management Platform.
                     </p>
                     <p style="margin: 0; color: #94a3b8; font-size: 12px;">
-                      © ${new Date().getFullYear()} FitFlow. All rights reserved.
+                      © ${new Date().getFullYear()} Gymatrix. All rights reserved.
                     </p>
                   </td>
                 </tr>
@@ -290,11 +290,11 @@ class EmailService {
     const html = `
       <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px;">
         <h2 style="color: #2563eb;">Hello ${userName},</h2>
-        <p>Thank you for contacting FitFlow! We've received your message regarding <strong>${subject}</strong>.</p>
+        <p>Thank you for contacting Gymatrix! We've received your message regarding <strong>${subject}</strong>.</p>
         <p>Our team will review your inquiry and get back to you as soon as possible.</p>
         <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;">
         <p style="color: #64748b; font-size: 14px;">This is an automated confirmation. No need to reply to this email.</p>
-        <p style="font-weight: bold; color: #0f172a;">Best regards,<br>The FitFlow Team</p>
+        <p style="font-weight: bold; color: #0f172a;">Best regards,<br>The Gymatrix Team</p>
       </div>
     `;
     return this.sendEmail({ to, subject: emailSubject, html });
