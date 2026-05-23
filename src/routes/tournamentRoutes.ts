@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate } from '../middleware/authMiddleware';
+import { authenticate, requireFeature, requirePermission } from '../middleware/authMiddleware';
 import * as tournamentController from '../controllers/tournamentController';
 
 const router = Router();
@@ -15,31 +15,32 @@ router.post('/master-data/mappings', tournamentController.createCategoryFormatMa
 // =========================================
 // Tournament CRUD (Gym Owner - Authenticated)
 // =========================================
-router.get('/', authenticate, tournamentController.getTournaments);
-router.post('/', authenticate, tournamentController.createTournament);
-router.get('/:id', authenticate, tournamentController.getTournamentById);
-router.patch('/:id', authenticate, tournamentController.updateTournament);
-router.delete('/:id', authenticate, tournamentController.deleteTournament);
+router.get('/', ...requireFeature('tournament'), ...requirePermission('view_tournaments'), tournamentController.getTournaments);
+router.post('/', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.createTournament);
+router.get('/:id', ...requireFeature('tournament'), ...requirePermission('view_tournaments'), tournamentController.getTournamentById);
+router.patch('/:id', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.updateTournament);
+router.delete('/:id', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.deleteTournament);
 
 // =========================================
 // Participants
 // =========================================
-router.post('/:id/participants', authenticate, tournamentController.addParticipants);
-router.delete('/:id/participants/:participantId', authenticate, tournamentController.removeParticipant);
+router.post('/:id/participants', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.addParticipants);
+router.delete('/:id/participants/:participantId', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.removeParticipant);
 
 // =========================================
 // Structure Generation & Results
 // =========================================
-router.post('/:id/generate', authenticate, tournamentController.generateStructure);
-router.post('/:id/advance', authenticate, tournamentController.advanceTournamentPhase);
-router.post('/:id/resolve-tie', authenticate, tournamentController.resolveTieBreaker);
-router.post('/:id/matches/:matchId/result', authenticate, tournamentController.submitMatchResult);
-router.patch('/:id/attempts/:attemptId', authenticate, tournamentController.updateAttempt);
+router.post('/:id/generate', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.generateStructure);
+router.post('/:id/advance', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.advanceTournamentPhase);
+router.post('/:id/resolve-tie', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.resolveTieBreaker);
+router.post('/:id/matches/:matchId/result', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.submitMatchResult);
+router.patch('/:id/attempts/:attemptId', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.updateAttempt);
 
 // =========================================
 // Leaderboard & Finalization
 // =========================================
-router.get('/:id/leaderboard', authenticate, tournamentController.getLeaderboard);
-router.post('/:id/finalize', authenticate, tournamentController.finalizeTournament);
+router.get('/:id/leaderboard', ...requireFeature('tournament'), ...requirePermission('view_tournaments'), tournamentController.getLeaderboard);
+router.post('/:id/finalize', ...requireFeature('tournament'), ...requirePermission('manage_tournaments'), tournamentController.finalizeTournament);
 
 export default router;
+

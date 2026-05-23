@@ -7,6 +7,7 @@ export interface AuthenticatedRequest extends Request {
     permissions?: string[];
     gymId?: number;
     staffId?: number;
+    isSuperAdmin?: boolean;
 }
 
 // Base Authentication Middleware (Injects user, gymId, and permissions)
@@ -25,6 +26,20 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
         }
 
         req.user = user;
+
+        // 0. Check if user is Super Admin
+        const { data: userRoles } = await supabaseAdmin
+            .from('user_roles')
+            .select('roles:roles(name)')
+            .eq('user_id', user.id);
+
+        const isSuperAdmin = userRoles?.some((ur: any) => ur.roles?.name === 'SUPER_ADMIN');
+
+        if (isSuperAdmin) {
+            req.permissions = ['*']; 
+            req.isSuperAdmin = true;
+            return next();
+        }
 
         // 1. Check if user is a Gym Owner (Owner has all permissions)
         const { data: gymData } = await supabaseAdmin
@@ -92,3 +107,72 @@ export const requirePermission = (requiredPermission: string) => {
         }
     ];
 };
+
+export const requireFeature = (featureKey: string) => {
+    return [
+        authenticate,
+        async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+            try {
+                if (!req.gymId) {
+                    return res.status(400).json({ error: 'Gym ID not found in request context' });
+                }
+
+                // 1. Get owner_id of the gym
+                const { data: gym, error: gymError } = await supabaseAdmin
+                    .from('gyms')
+                    .select('owner_id')
+                    .eq('id', req.gymId)
+                    .maybeSingle();
+
+                if (gymError || !gym) {
+                    return res.status(404).json({ error: 'Gym or gym owner not found' });
+                }
+
+                const ownerId = gym.owner_id;
+
+                // 2. Get active subscription for the owner
+                const { data: sub, error: subError } = await supabaseAdmin
+                    .from('subscriptions')
+                    .select('id')
+                    .eq('user_id', ownerId)
+                    .eq('status', 'active')
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+
+                if (subError || !sub) {
+                    return res.status(403).json({ error: 'Access Denied: No active subscription found for this gym' });
+                }
+
+                // 3. Check if the active subscription has the specified feature enabled
+                const { data: featureList, error: featureError } = await supabaseAdmin
+                    .from('subscription_features')
+                    .select('value, features!inner(key)')
+                    .eq('subscription_id', sub.id)
+                    .eq('features.key', featureKey)
+                    .maybeSingle();
+
+                if (featureError || !featureList || featureList.value !== 'true') {
+                    return res.status(403).json({ error: `Access Denied: Feature '${featureKey}' is not enabled in your subscription plan` });
+                }
+
+                next();
+            } catch (error) {
+                console.error('Feature Check Middleware Error:', error);
+                res.status(500).json({ error: 'Internal Server Error' });
+            }
+        }
+    ];
+};
+
+export const requireSuperAdmin = [
+    authenticate,
+    (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        if (req.isSuperAdmin) {
+            return next();
+        }
+        res.status(403).json({ error: 'Forbidden: Super Admin access required' });
+    }
+];
+
+
