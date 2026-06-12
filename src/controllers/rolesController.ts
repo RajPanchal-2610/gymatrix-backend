@@ -13,10 +13,47 @@ export const getMyPermissions = (req: AuthenticatedRequest, res: Response) => {
 // GET: My Role Info
 export const getMyRole = async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (req.permissions?.includes('*')) {
-            return res.json({ name: 'Super Admin', isOwner: true, staff_id: null });
+        if (req.isSuperAdmin) {
+            return res.json({ name: 'Super Admin', isOwner: false, staff_id: null });
         }
 
+        // Check if the user is a Gym Owner
+        const { data: gymData } = await supabaseAdmin
+            .from('gyms')
+            .select('id')
+            .eq('owner_id', req.user.id)
+            .limit(1)
+            .maybeSingle();
+
+        const isOwner = !!gymData;
+
+        // Check if the user has an active staff record
+        const { data: staffData } = await supabaseAdmin
+            .from('gym_staff')
+            .select('id, gym_roles(id, name, description)')
+            .eq('user_id', req.user.id)
+            .eq('is_deleted', false)
+            .eq('status', 'active')
+            .eq('allow_login', true)
+            .maybeSingle();
+
+        const hasStaffRecord = !!staffData;
+
+        // If currently acting as Owner
+        if (req.permissions?.includes('*')) {
+            const staffRoles = staffData?.gym_roles as any;
+            const staffRoleName = Array.isArray(staffRoles) ? staffRoles[0]?.name : staffRoles?.name;
+            return res.json({
+                name: 'Owner',
+                description: 'Gym Owner with full control',
+                isOwner: true,
+                staff_id: staffData?.id || null,
+                hasStaffRecord,
+                staffRoleName: staffRoleName || null
+            });
+        }
+
+        // Currently acting as staff/trainer
         const { data, error } = await supabaseAdmin
             .from('gym_staff')
             .select('id, gym_roles(id, name, description)')
@@ -24,9 +61,16 @@ export const getMyRole = async (req: AuthenticatedRequest, res: Response) => {
             .single();
 
         if (error) throw error;
+
+        const gymRoles = data?.gym_roles as any;
+        const staffRoleObj = Array.isArray(gymRoles) ? gymRoles[0] : gymRoles;
+
         res.json({
-            ...(data?.gym_roles || { name: 'Staff' }),
-            staff_id: data?.id
+            ...(staffRoleObj || { name: 'Staff' }),
+            staff_id: data?.id,
+            isOwner,
+            hasStaffRecord,
+            staffRoleName: staffRoleObj?.name || null
         });
     } catch (error: any) {
         res.status(500).json({ error: error.message });

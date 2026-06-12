@@ -14,7 +14,7 @@ router.get('/me/role', authenticate, rolesController.getMyRole);
 router.get('/:gymId', ...requirePermission('view_roles'), rolesController.getRolesByGym);
 
 // GET: Retrieve all available permissions
-router.get('/permissions/all', ...requirePermission('view_permissions'), rolesController.getAllPermissions);
+router.get('/permissions/all', authenticate, rolesController.getAllPermissions);
 
 // POST: Create a new Permission
 router.post('/permissions', ...requireSuperAdmin, rolesController.createPermission);
@@ -26,9 +26,9 @@ router.put('/permissions/:id', ...requireSuperAdmin, rolesController.updatePermi
 router.delete('/permissions/:id', ...requireSuperAdmin, rolesController.deletePermission);
 
 // POST: Create a new Role
-router.post('/', ...requirePermission('manage_roles'), rolesController.createRole);
+router.post('/', ...requirePermission('add_roles'), rolesController.createRole);
 
 // PUT: Update an existing Role & its permissions
-router.put('/:roleId', ...requirePermission('manage_roles'), rolesController.updateRole);
+router.put('/:roleId', ...requirePermission('edit_roles'), rolesController.updateRole);
 
 export default router;

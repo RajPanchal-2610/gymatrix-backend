@@ -26,6 +26,18 @@ export const submitContactMessage = async (req: Request, res: Response) => {
         emailService.sendContactConfirmation(email, full_name, subject);
         emailService.sendContactNotificationToAdmin({ full_name, email, subject, message });
 
+        // Insert system notification in Supabase
+        supabaseAdmin
+            .from('notifications')
+            .insert({
+                title: 'New Contact Message',
+                message: `Inquiry from ${full_name}: "${subject}"`,
+                type: 'system'
+            })
+            .then(({ error: notifErr }) => {
+                if (notifErr) console.error('Error creating contact message notification:', notifErr);
+            });
+
         return res.status(201).json({ 
             message: 'Message sent successfully',
             data: data[0]

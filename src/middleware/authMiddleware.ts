@@ -41,7 +41,10 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
             return next();
         }
 
-        // 1. Check if user is a Gym Owner (Owner has all permissions)
+        // Get the active role header (case-insensitive)
+        const activeRoleHeader = (req.headers['x-active-role'] as string || '').toLowerCase();
+
+        // 1. Fetch Gym Owner status
         const { data: gymData } = await supabaseAdmin
             .from('gyms')
             .select('id')
@@ -49,13 +52,9 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
             .limit(1)
             .maybeSingle();
 
-        if (gymData) {
-            req.gymId = gymData.id;
-            req.permissions = ['*']; 
-            return next();
-        }
+        const isOwner = !!gymData;
 
-        // 2. If not owner, check Staff Record
+        // 2. Fetch Staff Record
         const { data: staffData, error: staffError } = await supabaseAdmin
             .from('gym_staff')
             .select('id, gym_id, role_id')
@@ -65,30 +64,70 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
             .eq('allow_login', true)
             .maybeSingle();
 
-        if (staffError || !staffData) {
+        const hasStaffRecord = !!staffData;
+
+        // 3. Resolve context based on ownership, staff status, and activeRoleHeader
+        if (isOwner && hasStaffRecord) {
+            // User is BOTH owner and staff member
+            if (activeRoleHeader === 'trainer' || activeRoleHeader === 'staff') {
+                // User explicitly selected to act as Trainer/Staff
+                req.gymId = staffData.gym_id;
+                req.staffId = staffData.id;
+
+                if (!staffData.role_id) {
+                    req.permissions = [];
+                    return next();
+                }
+
+                // Fetch Permissions for Staff Role
+                const { data: rolePerms, error: permError } = await supabaseAdmin
+                    .from('gym_role_permissions')
+                    .select('permissions ( action )')
+                    .eq('role_id', staffData.role_id);
+
+                if (permError || !rolePerms) {
+                    return res.status(403).json({ error: 'Error fetching staff permissions' });
+                }
+
+                req.permissions = rolePerms.map((rp: any) => rp.permissions?.action).filter(Boolean);
+                return next();
+            } else {
+                // Default or explicitly selected Owner
+                req.gymId = gymData.id;
+                req.permissions = ['*']; // Owner has all permissions
+                req.staffId = staffData.id; // Also attach staff ID for staff-specific actions if needed
+                return next();
+            }
+        } else if (isOwner) {
+            // User is ONLY Owner
+            req.gymId = gymData.id;
+            req.permissions = ['*']; 
+            return next();
+        } else if (hasStaffRecord) {
+            // User is ONLY Staff
+            req.gymId = staffData.gym_id;
+            req.staffId = staffData.id;
+
+            if (!staffData.role_id) {
+                req.permissions = [];
+                return next();
+            }
+
+            // Fetch Permissions for Staff Role
+            const { data: rolePerms, error: permError } = await supabaseAdmin
+                .from('gym_role_permissions')
+                .select('permissions ( action )')
+                .eq('role_id', staffData.role_id);
+
+            if (permError || !rolePerms) {
+                return res.status(403).json({ error: 'Error fetching staff permissions' });
+            }
+
+            req.permissions = rolePerms.map((rp: any) => rp.permissions?.action).filter(Boolean);
+            return next();
+        } else {
             return res.status(403).json({ error: 'Access Denied: Not an active staff member or owner' });
         }
-
-        req.gymId = staffData.gym_id;
-        req.staffId = staffData.id;
-
-        if (!staffData.role_id) {
-            req.permissions = [];
-            return next();
-        }
-
-        // 3. Fetch Permissions for Staff Role
-        const { data: rolePerms, error: permError } = await supabaseAdmin
-            .from('gym_role_permissions')
-            .select('permissions ( action )')
-            .eq('role_id', staffData.role_id);
-
-        if (permError || !rolePerms) {
-            return res.status(403).json({ error: 'Error fetching permissions' });
-        }
-
-        req.permissions = rolePerms.map((rp: any) => rp.permissions?.action).filter(Boolean);
-        next();
     } catch (error) {
         console.error('Auth Middleware Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
