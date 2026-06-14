@@ -409,7 +409,11 @@ export class SubscriptionScheduler {
               end_date,
               renewed_at,
               gym_members (
-                full_name
+                full_name,
+                trainer_id,
+                gym_staff (
+                  user_id
+                )
               ),
               gym_membership_plans (
                 name
@@ -437,18 +441,29 @@ export class SubscriptionScheduler {
             const memberName = member?.full_name || 'A member';
             const planName = plan?.name || 'membership plan';
 
+            const trainerUserId = member?.gym_staff?.user_id || null;
+            const targetGymId = trainerUserId ? null : history.gym_id;
+            const targetUserId = trainerUserId || null;
+
             // Check for duplicate with same offset label
-            const { data: existing } = await supabaseAdmin
+            let dupQuery = supabaseAdmin
               .from('notifications')
               .select('id')
-              .eq('gym_id', history.gym_id)
               .eq('type', 'membership_expiring')
               .like('message', `%${memberName}%`)
               .like('message', `%${check.offset === 0 ? 'expires today' : check.offset > 0 ? `expire in ${check.offset} day` : `expired ${Math.abs(check.offset)} day`}%`)
               .gte('created_at', sevenDaysAgo.toISOString());
 
+            if (targetGymId) {
+              dupQuery = dupQuery.eq('gym_id', targetGymId);
+            } else {
+              dupQuery = dupQuery.eq('user_id', targetUserId);
+            }
+
+            const { data: existing } = await dupQuery;
+
             if (existing && existing.length > 0) {
-              console.log(`⏭️ Skipping ${memberName} (gym ${gym.id}, offset ${check.offset}) - already notified`);
+              console.log(`⏭️ Skipping ${memberName} (gym ${history.gym_id}, offset ${check.offset}) - already notified`);
               continue;
             }
 
@@ -476,8 +491,8 @@ export class SubscriptionScheduler {
             const { error: insertError } = await supabaseAdmin
               .from('notifications')
               .insert({
-                gym_id: history.gym_id,
-                user_id: null,
+                gym_id: targetGymId,
+                user_id: targetUserId,
                 title,
                 message,
                 type: 'membership_expiring'
@@ -486,7 +501,7 @@ export class SubscriptionScheduler {
             if (insertError) {
               console.error(`❌ Failed to create expiring notification for ${memberName}:`, insertError);
             } else {
-              console.log(`✉️ [Gym ${gym.id}] ${title}: ${memberName} (offset: ${check.offset})`);
+              console.log(`✉️ [Gym ${history.gym_id}] ${title}: ${memberName} (offset: ${check.offset}, targetUser: ${targetUserId})`);
             }
           }
         }
@@ -546,8 +561,13 @@ export class SubscriptionScheduler {
             due_amount,
             payment_status,
             billing_date,
+            remarks,
             gym_members (
-              full_name
+              full_name,
+              trainer_id,
+              gym_staff (
+                user_id
+              )
             ),
             gym_membership_history (
               plan_id,
@@ -581,15 +601,27 @@ export class SubscriptionScheduler {
           const memberName = member?.full_name || 'A member';
           const planName = plan?.name || 'membership plan';
 
+          const isPtPayment = payment.remarks === 'Personal Training Fee';
+          const trainerUserId = isPtPayment ? (member?.gym_staff?.user_id || null) : null;
+          const targetGymId = trainerUserId ? null : payment.gym_id;
+          const targetUserId = trainerUserId || null;
+
           // Check existing notifications for this member within the dedup window
-          const { data: existing, error: existingError } = await supabaseAdmin
+          let dupQuery = supabaseAdmin
             .from('notifications')
             .select('id')
-            .eq('gym_id', payment.gym_id)
             .eq('type', 'overdue_payment')
             .like('message', `%${memberName}%`)
             .like('message', `%overdue%`)
             .gte('created_at', dedupDate.toISOString());
+
+          if (targetGymId) {
+            dupQuery = dupQuery.eq('gym_id', targetGymId);
+          } else {
+            dupQuery = dupQuery.eq('user_id', targetUserId);
+          }
+
+          const { data: existing, error: existingError } = await dupQuery;
 
           if (existingError) {
             console.error('❌ Error checking existing overdue notifications:', existingError);
@@ -600,37 +632,51 @@ export class SubscriptionScheduler {
             // If max_reminders is set and we've already reached the limit, skip
             if (maxReminders > 0) {
               // Count total overdue notifications ever sent for this member
-              const { data: allNotifs } = await supabaseAdmin
+              let countQuery = supabaseAdmin
                 .from('notifications')
                 .select('id')
-                .eq('gym_id', payment.gym_id)
                 .eq('type', 'overdue_payment')
                 .like('message', `%${memberName}%`)
                 .like('message', `%overdue%`);
 
+              if (targetGymId) {
+                countQuery = countQuery.eq('gym_id', targetGymId);
+              } else {
+                countQuery = countQuery.eq('user_id', targetUserId);
+              }
+
+              const { data: allNotifs } = await countQuery;
+
               if (allNotifs && allNotifs.length >= maxReminders) {
-                console.log(`⏭️ Skipping ${memberName} (gym ${gym.id}) - max reminders (${maxReminders}) reached`);
+                console.log(`⏭️ Skipping ${memberName} (gym ${payment.gym_id}) - max reminders (${maxReminders}) reached`);
                 continue;
               }
             }
 
             // Within dedup window, skip
-            console.log(`⏭️ Skipping ${memberName} (gym ${gym.id}) - recently notified (interval: ${intervalDays}d)`);
+            console.log(`⏭️ Skipping ${memberName} (gym ${payment.gym_id}) - recently notified (interval: ${intervalDays}d)`);
             continue;
           }
 
           // Max reminders check for new notification outside dedup window
           if (maxReminders > 0) {
-            const { data: allNotifs } = await supabaseAdmin
+            let countQuery = supabaseAdmin
               .from('notifications')
               .select('id')
-              .eq('gym_id', payment.gym_id)
               .eq('type', 'overdue_payment')
               .like('message', `%${memberName}%`)
               .like('message', `%overdue%`);
 
+            if (targetGymId) {
+              countQuery = countQuery.eq('gym_id', targetGymId);
+            } else {
+              countQuery = countQuery.eq('user_id', targetUserId);
+            }
+
+            const { data: allNotifs } = await countQuery;
+
             if (allNotifs && allNotifs.length >= maxReminders) {
-              console.log(`⏭️ Skipping ${memberName} (gym ${gym.id}) - max reminders (${maxReminders}) reached`);
+              console.log(`⏭️ Skipping ${memberName} (gym ${payment.gym_id}) - max reminders (${maxReminders}) reached`);
               continue;
             }
           }
@@ -644,10 +690,12 @@ export class SubscriptionScheduler {
           const { error: insertError } = await supabaseAdmin
             .from('notifications')
             .insert({
-              gym_id: payment.gym_id,
-              user_id: null,
-              title: 'Overdue Payment Alert',
-              message: `${memberName} has an overdue payment of ₹${payment.due_amount} for '${planName}', billed on ${billingDateStr}.`,
+              gym_id: targetGymId,
+              user_id: targetUserId,
+              title: isPtPayment ? 'PT Fee Overdue Alert' : 'Overdue Payment Alert',
+              message: isPtPayment
+                ? `${memberName} has an overdue Personal Training Fee of ₹${payment.due_amount}, billed on ${billingDateStr}.`
+                : `${memberName} has an overdue payment of ₹${payment.due_amount} for '${planName}', billed on ${billingDateStr}.`,
               type: 'overdue_payment'
             });
 

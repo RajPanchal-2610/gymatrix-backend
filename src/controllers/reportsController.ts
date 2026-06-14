@@ -15,6 +15,7 @@ export const getCollectionReport = async (req: AuthenticatedRequest, res: Respon
                 amount, 
                 paid_at,
                 gym_membership_payments (
+                    remarks,
                     gym_members (
                         full_name
                     ),
@@ -43,7 +44,13 @@ export const getCollectionReport = async (req: AuthenticatedRequest, res: Respon
 
         // Group by month or year for the chart
         const groupedData: { [key: string]: number } = {};
-        data?.forEach((tx) => {
+        const filteredDetails: any[] = [];
+        data?.forEach((tx: any) => {
+            // Exclude Personal Training Fees
+            if (tx.gym_membership_payments?.remarks === 'Personal Training Fee') {
+                return;
+            }
+            filteredDetails.push(tx);
             const date = new Date(tx.paid_at);
             let key = '';
             if (groupBy === 'year') {
@@ -61,7 +68,7 @@ export const getCollectionReport = async (req: AuthenticatedRequest, res: Respon
 
         res.status(200).json({
             summary,
-            details: data // Send each individual record
+            details: filteredDetails
         });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -92,6 +99,7 @@ export const getPlanRevenue = async (req: AuthenticatedRequest, res: Response) =
                 amount,
                 paid_at,
                 gym_membership_payments (
+                    remarks,
                     gym_members (
                         full_name
                     ),
@@ -121,6 +129,10 @@ export const getPlanRevenue = async (req: AuthenticatedRequest, res: Response) =
         });
 
         data?.forEach((tx: any) => {
+            // Exclude Personal Training Fees
+            if (tx.gym_membership_payments?.remarks === 'Personal Training Fee') {
+                return;
+            }
             const planName = tx.gym_membership_payments?.gym_membership_history?.gym_membership_plans?.name;
             if (planName) {
                 planTotals[planName] = (planTotals[planName] || 0) + Number(tx.amount);
@@ -133,12 +145,19 @@ export const getPlanRevenue = async (req: AuthenticatedRequest, res: Response) =
         }));
 
         if (groupBy === 'none') {
-            return res.status(200).json({ summary, details: data });
+            const filteredDetails = data?.filter((tx: any) => tx.gym_membership_payments?.remarks !== 'Personal Training Fee') || [];
+            return res.status(200).json({ summary, details: filteredDetails });
         }
 
         // Trend View (Monthly/Yearly)
         const trendData: { [key: string]: { [plan: string]: number } } = {};
+        const filteredDetails: any[] = [];
         data?.forEach((tx: any) => {
+            // Exclude Personal Training Fees
+            if (tx.gym_membership_payments?.remarks === 'Personal Training Fee') {
+                return;
+            }
+            filteredDetails.push(tx);
             const date = new Date(tx.paid_at);
             const planName = tx.gym_membership_payments?.gym_membership_history?.gym_membership_plans?.name || 'Others';
 
@@ -167,7 +186,7 @@ export const getPlanRevenue = async (req: AuthenticatedRequest, res: Response) =
             summary, 
             trend: trendResult, 
             plans: allPlanNames, 
-            details: data 
+            details: filteredDetails 
         });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -289,28 +308,46 @@ export const getReportsOverview = async (req: AuthenticatedRequest, res: Respons
         // 1. Total Collection (Life-time)
         const { data: collectionData, error: collError } = await supabaseAdmin
             .from('gym_payment_transactions')
-            .select('amount')
+            .select(`
+                amount,
+                gym_membership_payments (remarks)
+            `)
             .eq('gym_id', gymId);
 
         if (collError) throw collError;
-        const totalCollection = collectionData?.reduce((acc, curr) => acc + Number(curr.amount), 0) || 0;
+        const totalCollection = collectionData?.reduce((acc, curr: any) => {
+            if (curr.gym_membership_payments?.remarks === 'Personal Training Fee') return acc;
+            return acc + Number(curr.amount);
+        }, 0) || 0;
 
         // 1b. This Month vs Last Month Collection
         const { data: thisMonthCollData } = await supabaseAdmin
             .from('gym_payment_transactions')
-            .select('amount')
+            .select(`
+                amount,
+                gym_membership_payments (remarks)
+            `)
             .eq('gym_id', gymId)
             .gte('paid_at', startOfMonthDate);
 
         const { data: lastMonthCollData } = await supabaseAdmin
             .from('gym_payment_transactions')
-            .select('amount')
+            .select(`
+                amount,
+                gym_membership_payments (remarks)
+            `)
             .eq('gym_id', gymId)
             .gte('paid_at', startOfLastMonthDate)
             .lt('paid_at', startOfMonthDate);
 
-        const thisMonthCollection = thisMonthCollData?.reduce((acc, curr) => acc + Number(curr.amount), 0) || 0;
-        const lastMonthCollection = lastMonthCollData?.reduce((acc, curr) => acc + Number(curr.amount), 0) || 0;
+        const thisMonthCollection = thisMonthCollData?.reduce((acc, curr: any) => {
+            if (curr.gym_membership_payments?.remarks === 'Personal Training Fee') return acc;
+            return acc + Number(curr.amount);
+        }, 0) || 0;
+        const lastMonthCollection = lastMonthCollData?.reduce((acc, curr: any) => {
+            if (curr.gym_membership_payments?.remarks === 'Personal Training Fee') return acc;
+            return acc + Number(curr.amount);
+        }, 0) || 0;
 
         let collectionTrend = 0;
         if (lastMonthCollection > 0) {
