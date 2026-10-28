@@ -20,6 +20,8 @@ import workoutRoutes from './routes/workoutRoutes';
 import gymRoutes from './routes/gymRoutes';
 import publicRoutes from './routes/publicRoutes';
 import leadRoutes from './routes/leadRoutes';
+import whatsappRoutes from './routes/whatsappRoutes';
+import memberRoutes from './routes/memberRoutes';
 import { subscriptionScheduler } from './services/subscriptionScheduler';
 
 const app = express();
@@ -31,6 +33,8 @@ app.use(express.json());
 
 // Routes
 app.use('/api', leadRoutes);
+app.use('/api/whatsapp', whatsappRoutes);
+app.use('/api/members', memberRoutes);
 app.use('/api/staff', staffRoutes);
 app.use('/api/roles', rolesRoutes);
 app.use('/api/attendance', attendanceRoutes);

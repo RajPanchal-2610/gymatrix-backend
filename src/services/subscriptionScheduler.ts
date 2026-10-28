@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { supabaseAdmin } from '../lib/supabase';
 import { emailService } from './emailService';
+import { metaWhatsAppService } from './metaWhatsAppService';
 
 interface SubscriptionWithUser {
   id: number;
@@ -336,7 +337,7 @@ export class SubscriptionScheduler {
       // 1. Fetch all gyms with their notification_settings
       const { data: gymsList, error: gymsError } = await supabaseAdmin
         .from('gyms')
-        .select('id, notification_settings');
+        .select('id, name, notification_settings');
 
       if (gymsError) {
         console.error('❌ Error fetching gyms:', gymsError);
@@ -365,23 +366,46 @@ export class SubscriptionScheduler {
           }
         }
 
+        // Fetch WhatsApp wallet settings for this gym
+        const { data: wallet } = await supabaseAdmin
+          .from('gym_whatsapp_wallets')
+          .select('is_automated_enabled, send_expiry_alert, expiry_reminder_days, expiry_followup_interval')
+          .eq('gym_id', gym.id)
+          .maybeSingle();
+
         // Collect all day offsets to check for this gym
         // before_days: positive offsets into the future (e.g., 3 = 3 days from now)
         // on_day: offset 0 (today)
         // after_days: negative offsets into the past (e.g., 3 = 3 days ago)
         const dayChecks: { offset: number; label: string }[] = [];
 
-        if (expiryConfig.before_days && Array.isArray(expiryConfig.before_days)) {
-          for (const d of expiryConfig.before_days) {
-            dayChecks.push({ offset: d, label: `in ${d} day${d === 1 ? '' : 's'}` });
+        if (wallet && Array.isArray(wallet.expiry_reminder_days) && wallet.expiry_reminder_days.length > 0) {
+          for (const d of wallet.expiry_reminder_days) {
+            if (d === 0) {
+              dayChecks.push({ offset: 0, label: 'today' });
+            } else if (d > 0) {
+              dayChecks.push({ offset: d, label: `in ${d} day${d === 1 ? '' : 's'}` });
+            }
+          }
+        } else {
+          if (expiryConfig.before_days && Array.isArray(expiryConfig.before_days)) {
+            for (const d of expiryConfig.before_days) {
+              dayChecks.push({ offset: d, label: `in ${d} day${d === 1 ? '' : 's'}` });
+            }
+          }
+          if (expiryConfig.on_day) {
+            dayChecks.push({ offset: 0, label: 'today' });
           }
         }
 
-        if (expiryConfig.on_day) {
-          dayChecks.push({ offset: 0, label: 'today' });
-        }
-
-        if (expiryConfig.after_days && Array.isArray(expiryConfig.after_days)) {
+        // Follow-up intervals after expiry if unrenewed
+        const expiryFollowup = wallet?.expiry_followup_interval !== undefined ? wallet.expiry_followup_interval : 7;
+        if (expiryFollowup > 0) {
+          for (const multiplier of [1, 2, 3]) {
+            const pastDays = expiryFollowup * multiplier;
+            dayChecks.push({ offset: -pastDays, label: `${pastDays} day${pastDays === 1 ? '' : 's'} ago` });
+          }
+        } else if (expiryConfig.after_days && Array.isArray(expiryConfig.after_days)) {
           for (const d of expiryConfig.after_days) {
             dayChecks.push({ offset: -d, label: `${d} day${d === 1 ? '' : 's'} ago` });
           }
@@ -410,6 +434,7 @@ export class SubscriptionScheduler {
               renewed_at,
               gym_members (
                 full_name,
+                phone,
                 assigned_staff_id,
                 gym_staff (
                   user_id
@@ -502,6 +527,18 @@ export class SubscriptionScheduler {
               console.error(`❌ Failed to create expiring notification for ${memberName}:`, insertError);
             } else {
               console.log(`✉️ [Gym ${history.gym_id}] ${title}: ${memberName} (offset: ${check.offset}, targetUser: ${targetUserId})`);
+
+              // Automated WhatsApp Alert via Meta Cloud API
+              if (member?.phone) {
+                metaWhatsAppService.sendMembershipExpiryAlert({
+                  gymId: history.gym_id,
+                  gymName: (gym as any)?.name || 'Gymatrix',
+                  memberName,
+                  memberPhone: member.phone,
+                  planName,
+                  expiryDate
+                }).catch((waErr) => console.error(`WhatsApp expiry notification error for ${memberName}:`, waErr));
+              }
             }
           }
         }
@@ -525,7 +562,7 @@ export class SubscriptionScheduler {
       // 1. Fetch all gyms with their notification_settings
       const { data: gymsList, error: gymsError } = await supabaseAdmin
         .from('gyms')
-        .select('id, notification_settings');
+        .select('id, name, notification_settings');
 
       if (gymsError) {
         console.error('❌ Error fetching gyms for overdue check:', gymsError);
@@ -548,7 +585,126 @@ export class SubscriptionScheduler {
           }
         }
 
-        const intervalDays = overdueConfig.reminder_interval_days || 7;
+        // Fetch WhatsApp wallet settings for this gym
+        const { data: wallet } = await supabaseAdmin
+          .from('gym_whatsapp_wallets')
+          .select('is_automated_enabled, send_payment_reminder, payment_reminder_days, payment_followup_interval')
+          .eq('gym_id', gym.id)
+          .maybeSingle();
+
+        // 1. Check Upcoming & Due Today Payment Reminders
+        const advanceDays = Array.isArray(wallet?.payment_reminder_days) ? wallet.payment_reminder_days : [1, 0];
+        for (const d of advanceDays) {
+          const targetDate = new Date();
+          targetDate.setDate(targetDate.getDate() + d);
+          const targetDateStr = targetDate.toISOString().split('T')[0];
+
+          const { data: upcomingPayments } = await supabaseAdmin
+            .from('gym_membership_payments')
+            .select(`
+              id,
+              gym_id,
+              member_id,
+              due_amount,
+              payment_status,
+              billing_date,
+              remarks,
+              gym_members (
+                full_name,
+                phone,
+                assigned_staff_id,
+                gym_staff (
+                  user_id
+                )
+              ),
+              gym_membership_history (
+                plan_id,
+                gym_membership_plans (
+                  name
+                )
+              )
+            `)
+            .eq('gym_id', gym.id)
+            .in('payment_status', ['unpaid', 'partial'])
+            .gt('due_amount', 0)
+            .eq('billing_date', targetDateStr);
+
+          if (!upcomingPayments || upcomingPayments.length === 0) continue;
+
+          for (const payment of upcomingPayments) {
+            const member = payment.gym_members as any;
+            const historyObj = payment.gym_membership_history as any;
+            const plan = historyObj?.gym_membership_plans as any;
+            const memberName = member?.full_name || 'A member';
+            const planName = plan?.name || 'membership plan';
+
+            const isPtPayment = payment.remarks === 'Personal Training Fee';
+            const staffUserId = isPtPayment ? (member?.gym_staff?.user_id || null) : null;
+            const targetGymId = staffUserId ? null : payment.gym_id;
+            const targetUserId = staffUserId || null;
+
+            const todayStart = new Date();
+            todayStart.setHours(0, 0, 0, 0);
+
+            let dupQuery = supabaseAdmin
+              .from('notifications')
+              .select('id')
+              .like('message', `%${memberName}%`)
+              .gte('created_at', todayStart.toISOString());
+
+            if (targetGymId) {
+              dupQuery = dupQuery.eq('gym_id', targetGymId);
+            } else {
+              dupQuery = dupQuery.eq('user_id', targetUserId);
+            }
+
+            const { data: existing } = await dupQuery;
+            if (existing && existing.length > 0) continue;
+
+            const billingDateStr = new Date(payment.billing_date).toLocaleDateString('en-US', {
+              year: 'numeric',
+              month: 'long',
+              day: 'numeric'
+            });
+
+            const title = d === 0 ? 'Payment Due Today' : 'Upcoming Payment Reminder';
+            const message = isPtPayment
+              ? (d === 0
+                  ? `${memberName} has a Personal Training Fee of ₹${payment.due_amount} due today (${billingDateStr}).`
+                  : `${memberName} has an upcoming Personal Training Fee of ₹${payment.due_amount} due in ${d} day${d === 1 ? '' : 's'} on ${billingDateStr}.`)
+              : (d === 0
+                  ? `${memberName} has a payment of ₹${payment.due_amount} for '${planName}' due today (${billingDateStr}).`
+                  : `${memberName} has an upcoming payment of ₹${payment.due_amount} for '${planName}' due in ${d} day${d === 1 ? '' : 's'} on ${billingDateStr}.`);
+
+            await supabaseAdmin.from('notifications').insert({
+              gym_id: targetGymId,
+              user_id: targetUserId,
+              title,
+              message,
+              type: 'payment_reminder'
+            });
+
+            if (member?.phone) {
+              metaWhatsAppService.sendPaymentReminder({
+                gymId: gym.id,
+                gymName: (gym as any)?.name || 'Gymatrix',
+                memberName,
+                memberPhone: member.phone,
+                planName: isPtPayment ? 'Personal Training' : planName,
+                dueAmount: payment.due_amount,
+                dueDate: billingDateStr
+              }).catch((waErr) => console.error(`WhatsApp upcoming payment reminder error for ${memberName}:`, waErr));
+            }
+          }
+        }
+
+        // 2. Check Overdue Follow-ups
+        const intervalDays = wallet?.payment_followup_interval !== undefined ? wallet.payment_followup_interval : (overdueConfig.reminder_interval_days || 7);
+        if (intervalDays === 0) {
+          // None - no follow-up reminders after due date
+          continue;
+        }
+
         const maxReminders = overdueConfig.max_reminders || 0;
 
         // Query unpaid or partial payments billed in the past for this gym
@@ -564,6 +720,7 @@ export class SubscriptionScheduler {
             remarks,
             gym_members (
               full_name,
+              phone,
               assigned_staff_id,
               gym_staff (
                 user_id
@@ -589,8 +746,7 @@ export class SubscriptionScheduler {
         if (!payments || payments.length === 0) continue;
 
         // Calculate dedup window based on gym's interval setting
-        // If interval is 0 (only once), use a very large lookback
-        const dedupDays = intervalDays === 0 ? 36500 : intervalDays; // 100 years for "only once"
+        const dedupDays = intervalDays;
         const dedupDate = new Date();
         dedupDate.setDate(dedupDate.getDate() - dedupDays);
 
@@ -703,6 +859,19 @@ export class SubscriptionScheduler {
             console.error(`❌ Failed to create overdue notification for ${memberName}:`, insertError);
           } else {
             console.log(`✉️ [Gym ${gym.id}] Overdue payment notification: ${memberName} (₹${payment.due_amount})`);
+
+            // Automated WhatsApp Payment Reminder via Meta Cloud API
+            if (member?.phone) {
+              metaWhatsAppService.sendPaymentReminder({
+                gymId: gym.id,
+                gymName: (gym as any)?.name || 'Gymatrix',
+                memberName,
+                memberPhone: member.phone,
+                planName: isPtPayment ? 'Personal Training' : planName,
+                dueAmount: payment.due_amount,
+                dueDate: billingDateStr
+              }).catch((waErr) => console.error(`WhatsApp payment reminder error for ${memberName}:`, waErr));
+            }
           }
         }
       }
