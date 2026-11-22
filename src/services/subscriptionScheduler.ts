@@ -32,25 +32,27 @@ export class SubscriptionScheduler {
   }
 
   /**
-   * Start the cron job - runs hourly to check each gym's preferred notification hour
+   * Start the cron job - runs every minute to check each gym's preferred notification time (hour and minute)
    */
   start() {
     // Cron pattern: minute hour day-of-month month day-of-week
-    // '0 * * * *' means every hour at minute 0
-    cron.schedule('0 * * * *', async () => {
-      const currentHour = new Date().getHours();
-      console.log(`⏰ Running hourly notification checkers for hour: ${currentHour}:00`);
+    // '* * * * *' means every minute
+    cron.schedule('* * * * *', async () => {
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentMinute = now.getMinutes();
+      const currentTimeStr = `${String(currentHour).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}`;
 
       // Expiring subscriptions (global check) - run once daily at 7:00 AM
-      if (currentHour === 7) {
+      if (currentHour === 7 && currentMinute === 0) {
         await this.checkExpiringSubscriptions();
       }
 
-      await this.checkExpiringGymMemberships(currentHour);
-      await this.checkOverdueGymPayments(currentHour);
+      await this.checkExpiringGymMemberships(currentTimeStr);
+      await this.checkOverdueGymPayments(currentTimeStr);
     });
 
-    console.log('✅ Subscription scheduler started - checks hourly for matching gym preferred times');
+    console.log('✅ Subscription scheduler started - checks every minute for matching gym preferred times (HH:mm)');
   }
 
   /**
@@ -330,9 +332,12 @@ export class SubscriptionScheduler {
   /**
    * Check for gym members whose active memberships match any configured notification day offset
    */
-  async checkExpiringGymMemberships(currentHour?: number | null) {
+  async checkExpiringGymMemberships(currentTime?: string | number | null) {
     try {
-      console.log(`🔍 Checking for gym member membership expiry notifications (hour: ${currentHour !== undefined && currentHour !== null ? `${currentHour}:00` : 'all'})...`);
+      const isTopHourOrManual = currentTime === null || currentTime === undefined || (typeof currentTime === 'string' && currentTime.endsWith(':00'));
+      if (isTopHourOrManual) {
+        console.log(`🔍 Checking for gym member membership expiry notifications (time: ${currentTime ?? 'all'})...`);
+      }
 
       // 1. Fetch all gyms with their notification_settings
       const { data: gymsList, error: gymsError } = await supabaseAdmin
@@ -345,7 +350,7 @@ export class SubscriptionScheduler {
       }
 
       if (!gymsList || gymsList.length === 0) {
-        console.log('✅ No gyms found');
+        if (isTopHourOrManual) console.log('✅ No gyms found');
         return;
       }
 
@@ -358,11 +363,19 @@ export class SubscriptionScheduler {
         const settings = gym.notification_settings || defaultSettings;
         const expiryConfig = settings.membership_expiry || defaultSettings.membership_expiry;
 
-        if (currentHour !== undefined && currentHour !== null) {
+        if (currentTime !== undefined && currentTime !== null) {
           const preferredTimeStr = expiryConfig.preferred_time || '07:00';
-          const preferredHour = parseInt(preferredTimeStr.split(':')[0]);
-          if (preferredHour !== currentHour) {
-            continue;
+          if (typeof currentTime === 'string') {
+            const [pHour, pMin] = preferredTimeStr.split(':').map((s: string) => parseInt(s.trim(), 10) || 0);
+            const normalizedPreferred = `${String(pHour).padStart(2, '0')}:${String(pMin).padStart(2, '0')}`;
+            if (normalizedPreferred !== currentTime) {
+              continue;
+            }
+          } else {
+            const preferredHour = parseInt(preferredTimeStr.split(':')[0], 10);
+            if (preferredHour !== currentTime) {
+              continue;
+            }
           }
         }
 
@@ -390,18 +403,24 @@ export class SubscriptionScheduler {
         } else {
           if (expiryConfig.before_days && Array.isArray(expiryConfig.before_days)) {
             for (const d of expiryConfig.before_days) {
-              dayChecks.push({ offset: d, label: `in ${d} day${d === 1 ? '' : 's'}` });
+              if (d === 0) {
+                dayChecks.push({ offset: 0, label: 'today' });
+              } else if (d > 0) {
+                dayChecks.push({ offset: d, label: `in ${d} day${d === 1 ? '' : 's'}` });
+              }
             }
           }
-          if (expiryConfig.on_day) {
+          if (expiryConfig.on_day && !dayChecks.some((c) => c.offset === 0)) {
             dayChecks.push({ offset: 0, label: 'today' });
           }
         }
 
-        // Follow-up intervals after expiry if unrenewed
-        const expiryFollowup = wallet?.expiry_followup_interval !== undefined ? wallet.expiry_followup_interval : 7;
+        // Follow-up intervals after expiry if unrenewed (Option B: strict multiples of intervalDays, e.g. 7, 14, 21, 28... days after expiry)
+        const expiryFollowup = wallet?.expiry_followup_interval !== undefined
+          ? wallet.expiry_followup_interval
+          : (expiryConfig.followup_interval !== undefined ? expiryConfig.followup_interval : 7);
         if (expiryFollowup > 0) {
-          for (const multiplier of [1, 2, 3]) {
+          for (const multiplier of [1, 2, 3, 4, 5, 6, 7, 8]) {
             const pastDays = expiryFollowup * multiplier;
             dayChecks.push({ offset: -pastDays, label: `${pastDays} day${pastDays === 1 ? '' : 's'} ago` });
           }
@@ -552,9 +571,12 @@ export class SubscriptionScheduler {
    * Check for gym members who have unpaid or partial membership payments in the past (overdue)
    * Uses per-gym reminder_interval_days and max_reminders settings
    */
-  async checkOverdueGymPayments(currentHour?: number | null) {
+  async checkOverdueGymPayments(currentTime?: string | number | null) {
     try {
-      console.log(`🔍 Checking for overdue member payments (hour: ${currentHour !== undefined && currentHour !== null ? `${currentHour}:00` : 'all'})...`);
+      const isTopHourOrManual = currentTime === null || currentTime === undefined || (typeof currentTime === 'string' && currentTime.endsWith(':00'));
+      if (isTopHourOrManual) {
+        console.log(`🔍 Checking for overdue member payments (time: ${currentTime ?? 'all'})...`);
+      }
 
       const today = new Date();
       today.setHours(23, 59, 59, 999);
@@ -577,11 +599,19 @@ export class SubscriptionScheduler {
         const settings = gym.notification_settings || {};
         const overdueConfig = settings.overdue_payment || defaultOverdue;
 
-        if (currentHour !== undefined && currentHour !== null) {
+        if (currentTime !== undefined && currentTime !== null) {
           const preferredTimeStr = overdueConfig.preferred_time || '07:00';
-          const preferredHour = parseInt(preferredTimeStr.split(':')[0]);
-          if (preferredHour !== currentHour) {
-            continue;
+          if (typeof currentTime === 'string') {
+            const [pHour, pMin] = preferredTimeStr.split(':').map((s: string) => parseInt(s.trim(), 10) || 0);
+            const normalizedPreferred = `${String(pHour).padStart(2, '0')}:${String(pMin).padStart(2, '0')}`;
+            if (normalizedPreferred !== currentTime) {
+              continue;
+            }
+          } else {
+            const preferredHour = parseInt(preferredTimeStr.split(':')[0], 10);
+            if (preferredHour !== currentTime) {
+              continue;
+            }
           }
         }
 
@@ -593,7 +623,11 @@ export class SubscriptionScheduler {
           .maybeSingle();
 
         // 1. Check Upcoming & Due Today Payment Reminders
-        const advanceDays = Array.isArray(wallet?.payment_reminder_days) ? wallet.payment_reminder_days : [1, 0];
+        const advanceDays = Array.isArray(wallet?.payment_reminder_days) && wallet.payment_reminder_days.length > 0
+          ? wallet.payment_reminder_days
+          : (Array.isArray(overdueConfig?.before_days) && overdueConfig.before_days.length > 0
+              ? overdueConfig.before_days
+              : [1, 0]);
         for (const d of advanceDays) {
           const targetDate = new Date();
           targetDate.setDate(targetDate.getDate() + d);
@@ -745,12 +779,21 @@ export class SubscriptionScheduler {
 
         if (!payments || payments.length === 0) continue;
 
-        // Calculate dedup window based on gym's interval setting
-        const dedupDays = intervalDays;
-        const dedupDate = new Date();
-        dedupDate.setDate(dedupDate.getDate() - dedupDays);
-
         for (const payment of payments) {
+          const paymentBillingDate = new Date(payment.billing_date);
+          const todayMidnight = new Date();
+          todayMidnight.setHours(0, 0, 0, 0);
+          paymentBillingDate.setHours(0, 0, 0, 0);
+
+          const diffTime = todayMidnight.getTime() - paymentBillingDate.getTime();
+          const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+
+          // Option B (Strict): Only trigger on exact multiples of intervalDays after due date
+          // e.g., for intervalDays = 7, trigger only on days 7, 14, 21, 28... after due date (never on day 1..6)
+          if (diffDays <= 0 || diffDays < intervalDays || diffDays % intervalDays !== 0) {
+            continue;
+          }
+
           const member = payment.gym_members as any;
           const historyObj = payment.gym_membership_history as any;
           const plan = historyObj?.gym_membership_plans as any;
@@ -762,14 +805,16 @@ export class SubscriptionScheduler {
           const targetGymId = staffUserId ? null : payment.gym_id;
           const targetUserId = staffUserId || null;
 
-          // Check existing notifications for this member within the dedup window
+          // Check if an overdue notification was already sent today for this member
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+
           let dupQuery = supabaseAdmin
             .from('notifications')
             .select('id')
             .eq('type', 'overdue_payment')
             .like('message', `%${memberName}%`)
-            .like('message', `%overdue%`)
-            .gte('created_at', dedupDate.toISOString());
+            .gte('created_at', todayStart.toISOString());
 
           if (targetGymId) {
             dupQuery = dupQuery.eq('gym_id', targetGymId);
@@ -785,43 +830,17 @@ export class SubscriptionScheduler {
           }
 
           if (existing && existing.length > 0) {
-            // If max_reminders is set and we've already reached the limit, skip
-            if (maxReminders > 0) {
-              // Count total overdue notifications ever sent for this member
-              let countQuery = supabaseAdmin
-                .from('notifications')
-                .select('id')
-                .eq('type', 'overdue_payment')
-                .like('message', `%${memberName}%`)
-                .like('message', `%overdue%`);
-
-              if (targetGymId) {
-                countQuery = countQuery.eq('gym_id', targetGymId);
-              } else {
-                countQuery = countQuery.eq('user_id', targetUserId);
-              }
-
-              const { data: allNotifs } = await countQuery;
-
-              if (allNotifs && allNotifs.length >= maxReminders) {
-                console.log(`⏭️ Skipping ${memberName} (gym ${payment.gym_id}) - max reminders (${maxReminders}) reached`);
-                continue;
-              }
-            }
-
-            // Within dedup window, skip
-            console.log(`⏭️ Skipping ${memberName} (gym ${payment.gym_id}) - recently notified (interval: ${intervalDays}d)`);
+            // Already notified today on this milestone day
             continue;
           }
 
-          // Max reminders check for new notification outside dedup window
+          // If max_reminders is set, check total overdue notifications ever sent
           if (maxReminders > 0) {
             let countQuery = supabaseAdmin
               .from('notifications')
               .select('id')
               .eq('type', 'overdue_payment')
-              .like('message', `%${memberName}%`)
-              .like('message', `%overdue%`);
+              .like('message', `%${memberName}%`);
 
             if (targetGymId) {
               countQuery = countQuery.eq('gym_id', targetGymId);
@@ -850,8 +869,8 @@ export class SubscriptionScheduler {
               user_id: targetUserId,
               title: isPtPayment ? 'PT Fee Overdue Alert' : 'Overdue Payment Alert',
               message: isPtPayment
-                ? `${memberName} has an overdue Personal Training Fee of ₹${payment.due_amount}, billed on ${billingDateStr}.`
-                : `${memberName} has an overdue payment of ₹${payment.due_amount} for '${planName}', billed on ${billingDateStr}.`,
+                ? `${memberName} has an overdue Personal Training Fee of ₹${payment.due_amount}, due on ${billingDateStr}.`
+                : `${memberName} has an overdue payment of ₹${payment.due_amount} for '${planName}', due on ${billingDateStr}.`,
               type: 'overdue_payment'
             });
 

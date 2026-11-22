@@ -14,10 +14,22 @@ import {
   getConfig,
   saveConfig,
   verifyWebhook,
-  handleWebhook
+  handleWebhook,
+  completeEmbeddedSignup,
+  getWhatsAppStatus,
+  disconnectWhatsApp,
+  testCredentials,
+  setupWabaTemplates,
+  getWabaTemplates
 } from '../controllers/whatsappController';
+import { authenticate } from '../middleware/authMiddleware';
 
 const router = express.Router();
+
+// WhatsApp Embedded Signup & Tenant Connection
+router.post('/embedded-signup/complete', authenticate as any, completeEmbeddedSignup as any);
+router.get('/status', authenticate as any, getWhatsAppStatus as any);
+router.post('/disconnect', authenticate as any, disconnectWhatsApp as any);
 
 // Wallet, Settings & Logs
 router.get('/wallet/:gymId', getWallet);
@@ -36,7 +48,11 @@ router.delete('/super-admin/packs/:id', deletePack);
 
 // Sending Endpoints
 router.post('/send', sendMessage);
+router.post('/send-message', sendMessage);
 router.post('/deeplink', getDeeplink);
+router.post('/test-credentials', testCredentials);
+router.post('/setup-templates', setupWabaTemplates);
+router.get('/templates/:gymId', getWabaTemplates);
 
 // Super Admin Meta WhatsApp Configuration
 router.get('/config', getConfig);

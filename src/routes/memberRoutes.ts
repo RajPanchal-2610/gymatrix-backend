@@ -5,6 +5,7 @@ import {
   getMemberMe,
   getMemberDashboardData,
   changeMemberPassword,
+  submitPaymentReference,
 } from '../controllers/memberAuthController';
 import { authenticateMember } from '../middleware/memberAuthMiddleware';
 
@@ -18,5 +19,6 @@ router.post('/login', loginMember);
 router.get('/me', authenticateMember, getMemberMe);
 router.get('/dashboard', authenticateMember, getMemberDashboardData);
 router.post('/change-password', authenticateMember, changeMemberPassword);
+router.post('/submit-payment-reference', authenticateMember, submitPaymentReference);
 
 export default router;

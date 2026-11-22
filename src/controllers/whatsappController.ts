@@ -3,6 +3,8 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import { supabaseAdmin } from '../lib/supabase';
 import { metaWhatsAppService } from '../services/metaWhatsAppService';
+import { AuthenticatedRequest } from '../middleware/authMiddleware';
+import { encryptToken, decryptToken } from '../lib/encryption';
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || '',
@@ -33,14 +35,25 @@ export const getWallet = async (req: Request, res: Response) => {
 
     const expiryTime = gymData?.notification_settings?.membership_expiry?.preferred_time || '07:00';
     const paymentTime = gymData?.notification_settings?.overdue_payment?.preferred_time || '07:00';
+    const graceDays = gymData?.notification_settings?.overdue_payment?.payment_due_grace_days !== undefined
+      ? gymData.notification_settings.overdue_payment.payment_due_grace_days
+      : (gymData?.notification_settings?.overdue_payment?.new_member_due_days !== undefined
+          ? gymData.notification_settings.overdue_payment.new_member_due_days
+          : 3);
+
+    const whatsappSender = gymData?.notification_settings?.whatsapp_sender ||
+      ((wallet.custom_phone_number_id && wallet.custom_access_token) ? 'custom' : 'central');
 
     const availablePlan = Math.max(0, (wallet.plan_monthly_quota || 0) - (wallet.plan_quota_used || 0));
     const availableTotal = availablePlan + (wallet.addon_credits_balance || 0);
 
     res.json({
       ...wallet,
+      whatsapp_sender: whatsappSender,
       expiry_preferred_time: expiryTime,
       payment_preferred_time: paymentTime,
+      payment_due_grace_days: graceDays,
+      new_member_due_days: graceDays,
       available_plan_credits: availablePlan,
       available_total: availableTotal
     });
@@ -74,7 +87,10 @@ export const updateGymSettings = async (req: Request, res: Response) => {
       custom_waba_id,
       custom_access_token,
       expiry_preferred_time,
-      payment_preferred_time
+      payment_preferred_time,
+      payment_due_grace_days,
+      new_member_due_days,
+      whatsapp_sender
     } = req.body;
 
     const updates: any = { updated_at: new Date().toISOString() };
@@ -102,8 +118,12 @@ export const updateGymSettings = async (req: Request, res: Response) => {
 
     if (error) throw error;
 
-    // Update gym notification_settings preferred_time if provided
-    if (expiry_preferred_time !== undefined || payment_preferred_time !== undefined) {
+    // Update gym notification_settings preferred_time, grace days & sender choice if provided
+    const graceVal = payment_due_grace_days !== undefined
+      ? parseInt(payment_due_grace_days)
+      : (new_member_due_days !== undefined ? parseInt(new_member_due_days) : undefined);
+
+    if (expiry_preferred_time !== undefined || payment_preferred_time !== undefined || graceVal !== undefined || whatsapp_sender !== undefined) {
       const { data: gymData } = await supabaseAdmin
         .from('gyms')
         .select('notification_settings')
@@ -113,13 +133,15 @@ export const updateGymSettings = async (req: Request, res: Response) => {
       const currentNotif = gymData?.notification_settings || {};
       const newNotif = {
         ...currentNotif,
+        ...(whatsapp_sender !== undefined ? { whatsapp_sender } : {}),
         membership_expiry: {
           ...(currentNotif.membership_expiry || {}),
           ...(expiry_preferred_time ? { preferred_time: expiry_preferred_time } : {})
         },
         overdue_payment: {
           ...(currentNotif.overdue_payment || {}),
-          ...(payment_preferred_time ? { preferred_time: payment_preferred_time } : {})
+          ...(payment_preferred_time ? { preferred_time: payment_preferred_time } : {}),
+          ...(graceVal !== undefined ? { payment_due_grace_days: graceVal, new_member_due_days: graceVal } : {})
         }
       };
 
@@ -129,7 +151,13 @@ export const updateGymSettings = async (req: Request, res: Response) => {
         .eq('id', gymId);
     }
 
-    res.json({ success: true, wallet: updatedWallet });
+    res.json({
+      success: true,
+      wallet: {
+        ...updatedWallet,
+        whatsapp_sender: whatsapp_sender || 'central'
+      }
+    });
   } catch (error: any) {
     console.error('Error updating gym WhatsApp settings:', error);
     res.status(500).json({ error: 'Failed to update WhatsApp settings', details: error.message });
@@ -426,7 +454,7 @@ export const verifyPackPayment = async (req: Request, res: Response) => {
  */
 export const sendMessage = async (req: Request, res: Response) => {
   try {
-    const { gymId, recipientPhone, recipientName, eventType, variables, templateName } = req.body;
+    const { gymId, recipientPhone, recipientName, eventType, variables, templateName, languageCode } = req.body;
 
     if (!gymId || !recipientPhone || !eventType || !variables) {
       return res.status(400).json({ error: 'gymId, recipientPhone, eventType, and variables are required' });
@@ -438,7 +466,8 @@ export const sendMessage = async (req: Request, res: Response) => {
       recipientName,
       eventType,
       variables,
-      templateName
+      templateName,
+      languageCode
     });
 
     if (!result.success) {
@@ -517,6 +546,450 @@ export const saveConfig = async (req: Request, res: Response) => {
 };
 
 /**
+ * POST /api/whatsapp/test-credentials
+ * Test/verify custom Meta WhatsApp Cloud API credentials and discover WABA ID
+ */
+export const testCredentials = async (req: Request, res: Response) => {
+  try {
+    const { phoneNumberId, accessToken } = req.body;
+    if (!phoneNumberId || !accessToken) {
+      return res.status(400).json({ success: false, error: 'Phone Number ID and Access Token are required.' });
+    }
+
+    const trimmedPhoneId = String(phoneNumberId).trim();
+    const trimmedToken = String(accessToken).trim();
+
+    // Query Meta Graph API for the phone number details and linked WABA
+    const response = await fetch(
+      `https://graph.facebook.com/v20.0/${trimmedPhoneId}?fields=verified_name,display_phone_number,quality_rating,code_verification_status,whatsapp_business_account`,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${trimmedToken}`
+        }
+      }
+    );
+
+    const data = await response.json();
+    if (!response.ok) {
+      const errMsg = data?.error?.message || `Meta API verification failed with HTTP ${response.status}`;
+      return res.status(400).json({ success: false, error: errMsg });
+    }
+
+    const wabaId = data?.whatsapp_business_account?.id || null;
+
+    res.json({
+      success: true,
+      verified_name: data.verified_name || 'Verified WhatsApp Business',
+      display_phone_number: data.display_phone_number || trimmedPhoneId,
+      quality_rating: data.quality_rating || 'UNKNOWN',
+      code_verification_status: data.code_verification_status || 'VERIFIED',
+      waba_id: wabaId
+    });
+  } catch (error: any) {
+    console.error('Error testing WhatsApp credentials:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to verify credentials with Meta' });
+  }
+};
+
+/**
+ * POST /api/whatsapp/setup-templates
+ * Auto-create or sync required Gymatrix templates on custom WABA
+ */
+export const setupWabaTemplates = async (req: Request, res: Response) => {
+  try {
+    const { wabaId, accessToken, gymId } = req.body;
+    let resolvedWabaId = wabaId;
+    let resolvedToken = accessToken;
+
+    if ((!resolvedWabaId || !resolvedToken) && gymId) {
+      const { data: wallet } = await supabaseAdmin
+        .from('gym_whatsapp_wallets')
+        .select('custom_waba_id, custom_access_token')
+        .eq('gym_id', gymId)
+        .maybeSingle();
+
+      resolvedWabaId = resolvedWabaId || wallet?.custom_waba_id;
+      resolvedToken = resolvedToken || wallet?.custom_access_token;
+    }
+
+    if (!resolvedWabaId || !resolvedToken) {
+      return res.status(400).json({
+        success: false,
+        error: 'WhatsApp Business Account ID (WABA ID) and Access Token are required to setup templates.'
+      });
+    }
+
+    const result = await metaWhatsAppService.setupTemplatesOnWaba({
+      wabaId: resolvedWabaId,
+      accessToken: resolvedToken
+    });
+
+    res.json(result);
+  } catch (error: any) {
+    console.error('Error setting up WhatsApp templates:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to setup templates on Meta' });
+  }
+};
+
+/**
+ * GET /api/whatsapp/templates/:gymId
+ * Query template status on custom WABA for a gym
+ */
+export const getWabaTemplates = async (req: Request, res: Response) => {
+  try {
+    const gymId = parseInt(req.params.gymId);
+    if (isNaN(gymId)) {
+      return res.status(400).json({ error: 'Invalid gym ID' });
+    }
+
+    const { data: wallet } = await supabaseAdmin
+      .from('gym_whatsapp_wallets')
+      .select('custom_waba_id, custom_access_token')
+      .eq('gym_id', gymId)
+      .maybeSingle();
+
+    if (!wallet?.custom_waba_id || !wallet?.custom_access_token) {
+      return res.json({ success: true, templates: [] });
+    }
+
+    const result = await metaWhatsAppService.getWabaTemplatesStatus({
+      wabaId: wallet.custom_waba_id,
+      accessToken: wallet.custom_access_token
+    });
+
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * POST /api/whatsapp/embedded-signup/complete
+ * Exchange Meta OAuth authorization code, inspect WABA & Phone details (detecting Coexistence),
+ * auto-subscribe WABA to webhooks, encrypt token at rest, and store connection against authenticated gym.
+ */
+export const completeEmbeddedSignup = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const gymId = req.gymId;
+    if (!gymId) {
+      return res.status(400).json({ error: 'Authenticated gym context is required' });
+    }
+
+    const { code, waba_id, phone_number_id } = req.body;
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code is required' });
+    }
+
+    const appId = process.env.META_APP_ID;
+    const appSecret = process.env.META_APP_SECRET;
+
+    if (!appId || !appSecret) {
+      return res.status(500).json({
+        error: 'Meta App configuration missing on server (META_APP_ID or META_APP_SECRET not configured in .env)'
+      });
+    }
+
+    // 1. Exchange authorization code with Meta Graph API OAuth endpoint
+    // In Embedded Signup with Facebook Login for Business, redirect_uri is omitted
+    const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${encodeURIComponent(
+      appId
+    )}&client_secret=${encodeURIComponent(appSecret)}&code=${encodeURIComponent(code)}`;
+
+    const tokenRes = await fetch(tokenUrl, { method: 'GET' });
+    const tokenData: any = await tokenRes.json();
+
+    if (!tokenRes.ok || !tokenData.access_token) {
+      console.error('❌ Error exchanging code with Meta:', tokenData);
+      const errMsg = tokenData?.error?.message || 'Failed to exchange authorization code with Meta';
+      return res.status(400).json({ error: errMsg, details: tokenData });
+    }
+
+    const accessToken = tokenData.access_token;
+    const expiresInSeconds = tokenData.expires_in || 60 * 24 * 60 * 60; // 60 days default
+    const tokenExpiry = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+
+    // 2. Resolve WABA ID: either from signup callback or via debug_token
+    let resolvedWabaId = waba_id;
+    if (!resolvedWabaId) {
+      try {
+        const debugRes = await fetch(
+          `https://graph.facebook.com/debug_token?input_token=${accessToken}&access_token=${appId}|${appSecret}`
+        );
+        const debugData: any = await debugRes.json();
+        const granularScopes = debugData?.data?.granular_scopes || [];
+        const mgmtScope = granularScopes.find((s: any) => s.scope === 'whatsapp_business_management');
+        if (mgmtScope?.target_ids?.length > 0) {
+          resolvedWabaId = mgmtScope.target_ids[0];
+        }
+      } catch (debugErr) {
+        console.warn('Could not inspect debug_token for WABA ID:', debugErr);
+      }
+    }
+
+    if (!resolvedWabaId) {
+      return res.status(400).json({
+        error: 'Could not determine WhatsApp Business Account (WABA) ID from Meta session'
+      });
+    }
+
+    // 3. Fetch WABA Details
+    let businessName = '';
+    try {
+      const wabaRes = await fetch(
+        `https://graph.facebook.com/v21.0/${resolvedWabaId}?fields=id,name,currency,timezone_id`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        }
+      );
+      const wabaData: any = await wabaRes.json();
+      if (wabaRes.ok && wabaData.name) {
+        businessName = wabaData.name;
+      }
+    } catch (wabaErr) {
+      console.warn('Error fetching WABA details:', wabaErr);
+    }
+
+    // 4. Fetch Phone Numbers registered under this WABA
+    let selectedPhone: any = null;
+    let resolvedPhoneNumberId = phone_number_id || '';
+    let displayPhoneNumber = '';
+
+    try {
+      const phoneRes = await fetch(
+        `https://graph.facebook.com/v21.0/${resolvedWabaId}/phone_numbers?fields=id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,is_on_biz_app,status`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        }
+      );
+      const phoneData: any = await phoneRes.json();
+      const phoneNumbers: any[] = phoneData?.data || [];
+
+      selectedPhone = phoneNumbers.find((p) => p.id === phone_number_id) || phoneNumbers[0];
+
+      // If not in the list but phone_number_id was provided, query directly
+      if (!selectedPhone && phone_number_id) {
+        const singlePhoneRes = await fetch(
+          `https://graph.facebook.com/v21.0/${phone_number_id}?fields=id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,is_on_biz_app,status`,
+          {
+            headers: { Authorization: `Bearer ${accessToken}` }
+          }
+        );
+        if (singlePhoneRes.ok) {
+          selectedPhone = await singlePhoneRes.json();
+        }
+      }
+
+      if (selectedPhone) {
+        resolvedPhoneNumberId = selectedPhone.id || resolvedPhoneNumberId;
+        displayPhoneNumber = selectedPhone.display_phone_number || '';
+        if (selectedPhone.verified_name) {
+          businessName = selectedPhone.verified_name;
+        }
+      }
+    } catch (phoneErr) {
+      console.warn('Error fetching phone numbers for WABA:', phoneErr);
+    }
+
+    // 5. Coexistence Identification:
+    // Meta sets is_on_biz_app = true for WhatsApp Business App Coexistence numbers
+    const isOnBizApp = Boolean(selectedPhone?.is_on_biz_app);
+    const integrationType = isOnBizApp ? 'business_app_coexistence' : 'cloud_api';
+
+    // 6. Complete onboarding asset subscription:
+    // Subscribe WABA to Gymatrix app's webhooks (POST /{waba_id}/subscribed_apps)
+    try {
+      const subRes = await fetch(
+        `https://graph.facebook.com/v21.0/${resolvedWabaId}/subscribed_apps`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      const subData: any = await subRes.json();
+      if (!subRes.ok) {
+        console.warn('⚠️ Webhook auto-subscription returned non-OK status:', subData);
+      } else {
+        console.log(`✅ Successfully subscribed WABA ${resolvedWabaId} to app webhooks`);
+      }
+    } catch (subErr) {
+      console.warn('⚠️ Error subscribing WABA to webhooks:', subErr);
+    }
+
+    // 7. Encrypt access token at rest using AES-256-GCM
+    const encryptedToken = encryptToken(accessToken);
+
+    // 8. Upsert into gym_whatsapp_integrations
+    const integrationRecord = {
+      gym_id: gymId,
+      waba_id: resolvedWabaId,
+      phone_number_id: resolvedPhoneNumberId,
+      display_phone_number: displayPhoneNumber,
+      business_name: businessName || null,
+      access_token: encryptedToken,
+      token_expiry: tokenExpiry,
+      connection_status: 'connected',
+      integration_type: integrationType,
+      coexistence_status: {
+        is_on_biz_app: isOnBizApp,
+        coexistence_eligible: isOnBizApp,
+        platform_type: selectedPhone?.platform_type || 'CLOUD_API',
+        quality_rating: selectedPhone?.quality_rating || 'UNKNOWN',
+        code_verification_status: selectedPhone?.code_verification_status || 'VERIFIED',
+        connected_at: new Date().toISOString()
+      },
+      raw_metadata: {
+        phone_object: selectedPhone || null,
+        token_type: tokenData.token_type || 'bearer'
+      },
+      updated_at: new Date().toISOString()
+    };
+
+    const { data: savedIntegration, error: saveErr } = await supabaseAdmin
+      .from('gym_whatsapp_integrations')
+      .upsert(integrationRecord, { onConflict: 'gym_id' })
+      .select(
+        'id, gym_id, waba_id, phone_number_id, display_phone_number, business_name, token_expiry, connection_status, integration_type, coexistence_status, created_at, updated_at'
+      )
+      .single();
+
+    if (saveErr) {
+      console.error('Database error saving WhatsApp integration:', saveErr);
+      throw saveErr;
+    }
+
+    // Keep gym_whatsapp_wallets synced for backward compatibility
+    await supabaseAdmin
+      .from('gym_whatsapp_wallets')
+      .update({
+        custom_phone_number_id: resolvedPhoneNumberId,
+        custom_waba_id: resolvedWabaId,
+        custom_access_token: encryptedToken,
+        updated_at: new Date().toISOString()
+      })
+      .eq('gym_id', gymId);
+
+    res.json({
+      success: true,
+      message: isOnBizApp
+        ? 'WhatsApp Business connected with Coexistence active!'
+        : 'WhatsApp Cloud API connected successfully!',
+      integration: savedIntegration
+    });
+  } catch (error: any) {
+    console.error('Error completing WhatsApp embedded signup:', error);
+    res.status(500).json({
+      error: 'Failed to complete WhatsApp connection',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/whatsapp/status
+ * Get connection status and details for the authenticated gym (without exposing tokens)
+ */
+export const getWhatsAppStatus = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const gymId = req.gymId;
+    if (!gymId) {
+      return res.status(400).json({ error: 'Authenticated gym context is required' });
+    }
+
+    const { data: integration, error } = await supabaseAdmin
+      .from('gym_whatsapp_integrations')
+      .select(
+        'id, gym_id, waba_id, phone_number_id, display_phone_number, business_name, token_expiry, connection_status, integration_type, coexistence_status, created_at, updated_at'
+      )
+      .eq('gym_id', gymId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('Error fetching WhatsApp integration:', error);
+    }
+
+    const wallet = await metaWhatsAppService.getGymWallet(gymId);
+    const isConnected = !!(integration && integration.connection_status === 'connected');
+
+    res.json({
+      is_connected: isConnected,
+      integration: integration || null,
+      wallet: wallet || null
+    });
+  } catch (error: any) {
+    console.error('Error fetching WhatsApp status:', error);
+    res.status(500).json({ error: 'Failed to fetch WhatsApp status', details: error.message });
+  }
+};
+
+/**
+ * POST /api/whatsapp/disconnect
+ * Disconnect gym WhatsApp integration and unsubscribe WABA from app webhooks
+ */
+export const disconnectWhatsApp = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const gymId = req.gymId;
+    if (!gymId) {
+      return res.status(400).json({ error: 'Authenticated gym context is required' });
+    }
+
+    const { data: integration } = await supabaseAdmin
+      .from('gym_whatsapp_integrations')
+      .select('*')
+      .eq('gym_id', gymId)
+      .maybeSingle();
+
+    if (!integration) {
+      return res.json({ success: true, message: 'No active integration found' });
+    }
+
+    // Try unsubscribing from Meta Graph API
+    if (integration.waba_id && integration.access_token) {
+      try {
+        const decryptedToken = decryptToken(integration.access_token);
+        await fetch(`https://graph.facebook.com/v21.0/${integration.waba_id}/subscribed_apps`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${decryptedToken}` }
+        });
+      } catch (e) {
+        console.warn('Could not cleanly unsubscribe WABA from Meta during disconnect:', e);
+      }
+    }
+
+    // Mark as disconnected in database
+    await supabaseAdmin
+      .from('gym_whatsapp_integrations')
+      .update({
+        connection_status: 'disconnected',
+        updated_at: new Date().toISOString()
+      })
+      .eq('gym_id', gymId);
+
+    // Clear custom sender from wallet
+    await supabaseAdmin
+      .from('gym_whatsapp_wallets')
+      .update({
+        custom_phone_number_id: null,
+        custom_waba_id: null,
+        custom_access_token: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('gym_id', gymId);
+
+    res.json({
+      success: true,
+      message: 'WhatsApp disconnected successfully. Automated messages will now route via default gateway.'
+    });
+  } catch (error: any) {
+    console.error('Error disconnecting WhatsApp:', error);
+    res.status(500).json({ error: 'Failed to disconnect WhatsApp', details: error.message });
+  }
+};
+
+/**
  * Webhook Verification (GET /api/whatsapp/webhook)
  */
 export const verifyWebhook = async (req: Request, res: Response) => {
@@ -526,11 +999,17 @@ export const verifyWebhook = async (req: Request, res: Response) => {
     const challenge = req.query['hub.challenge'];
 
     const config = await metaWhatsAppService.getMetaConfig();
+    const expectedToken =
+      process.env.META_WA_WEBHOOK_VERIFY_TOKEN ||
+      config.webhook_verify_token ||
+      'gymatrix_meta_webhook_secret_2026';
 
-    if (mode === 'subscribe' && token === config.webhook_verify_token) {
+    if (mode === 'subscribe' && token === expectedToken) {
       console.log('✅ Meta WhatsApp webhook verified successfully!');
       return res.status(200).send(challenge);
     }
+
+    console.warn('❌ Webhook verification failed. Token mismatch.');
     return res.status(403).json({ error: 'Webhook token verification failed' });
   } catch (error) {
     res.status(500).end();
@@ -539,34 +1018,200 @@ export const verifyWebhook = async (req: Request, res: Response) => {
 
 /**
  * Handle incoming Meta WhatsApp Webhook events (POST /api/whatsapp/webhook)
+ * Verifies x-hub-signature-256 and handles:
+ * - messages & statuses
+ * - smb_message_echoes (Coexistence: messages sent from owner's mobile app)
+ * - smb_app_state_sync (Coexistence: contact sync from mobile app)
+ * - history (Coexistence: chat history backfill during onboarding)
+ * - account_update (WABA & Phone quality/ban updates)
  */
 export const handleWebhook = async (req: Request, res: Response) => {
   try {
+    // 1. Signature Verification
+    const signature = req.headers['x-hub-signature-256'] as string;
+    const appSecret = process.env.META_APP_SECRET;
+
+    if (appSecret && signature) {
+      const elements = signature.split('sha256=');
+      const signatureHash = elements[1];
+      const rawPayload = (req as any).rawBody || Buffer.from(JSON.stringify(req.body));
+      const expectedHash = crypto
+        .createHmac('sha256', appSecret)
+        .update(rawPayload)
+        .digest('hex');
+
+      if (signatureHash !== expectedHash) {
+        console.warn('❌ Meta webhook signature mismatch');
+        return res.status(401).send('Signature verification failed');
+      }
+    }
+
     const body = req.body;
 
-    if (body.object === 'whatsapp_business_account') {
-      const entry = body.entry?.[0];
-      const change = entry?.changes?.[0];
-      const value = change?.value;
-      const statuses = value?.statuses;
+    if (body.object === 'whatsapp_business_account' && Array.isArray(body.entry)) {
+      for (const entry of body.entry) {
+        const wabaId = entry.id;
+        const changes = entry.changes || [];
 
-      if (statuses && statuses.length > 0) {
-        for (const statusObj of statuses) {
-          const metaMsgId = statusObj.id;
-          const status = statusObj.status; // 'sent', 'delivered', 'read', 'failed'
+        for (const change of changes) {
+          const field = change.field;
+          const val = change.value;
 
-          if (metaMsgId && status) {
-            await supabaseAdmin
-              .from('whatsapp_logs')
-              .update({ status })
-              .eq('meta_message_id', metaMsgId);
+          // A. Standard Messages & Status Updates
+          if (field === 'messages') {
+            const statuses = val?.statuses || [];
+            for (const statusObj of statuses) {
+              const metaMsgId = statusObj.id;
+              const status = statusObj.status; // 'sent', 'delivered', 'read', 'failed'
+              const recipientId = statusObj.recipient_id;
+
+              if (metaMsgId && status) {
+                await supabaseAdmin
+                  .from('whatsapp_logs')
+                  .update({
+                    status,
+                    ...(statusObj.errors ? { error_message: JSON.stringify(statusObj.errors) } : {})
+                  })
+                  .eq('meta_message_id', metaMsgId);
+              }
+            }
+
+            const messages = val?.messages || [];
+            for (const msg of messages) {
+              const fromPhone = msg.from;
+              const msgId = msg.id;
+              const msgText = msg.text?.body || msg.type || 'Media message';
+              const phoneNumberId = val?.metadata?.phone_number_id;
+
+              // Find gym integration
+              const integration = phoneNumberId
+                ? await metaWhatsAppService.findIntegrationByPhoneNumber(phoneNumberId)
+                : await metaWhatsAppService.findIntegrationByWaba(wabaId);
+
+              if (integration) {
+                await supabaseAdmin.from('whatsapp_logs').insert({
+                  gym_id: integration.gym_id,
+                  recipient_phone: fromPhone,
+                  recipient_name: val?.contacts?.[0]?.profile?.name || null,
+                  event_type: 'custom',
+                  template_name: 'incoming_member_message',
+                  meta_message_id: msgId,
+                  sender_mode:
+                    integration.integration_type === 'business_app_coexistence'
+                      ? 'meta_coexistence'
+                      : 'meta_cloud_api_gym',
+                  status: 'received',
+                  credits_deducted: 0,
+                  error_message: msgText.substring(0, 500)
+                });
+              }
+            }
+          }
+
+          // B. Coexistence: smb_message_echoes
+          // Triggers when gym owner sends a message directly from the mobile WhatsApp Business App
+          else if (field === 'smb_message_echoes') {
+            const echoes = val?.message_echoes || val?.messages || [];
+            const phoneNumberId = val?.metadata?.phone_number_id;
+            const integration = phoneNumberId
+              ? await metaWhatsAppService.findIntegrationByPhoneNumber(phoneNumberId)
+              : await metaWhatsAppService.findIntegrationByWaba(wabaId);
+
+            if (integration && Array.isArray(echoes)) {
+              for (const echo of echoes) {
+                const echoId = echo.id;
+                const toPhone = echo.to;
+                const echoText = echo.text?.body || echo.type || 'App echo';
+
+                await supabaseAdmin.from('whatsapp_logs').insert({
+                  gym_id: integration.gym_id,
+                  recipient_phone: toPhone,
+                  recipient_name: null,
+                  event_type: 'custom',
+                  template_name: 'coexistence_app_echo',
+                  meta_message_id: echoId,
+                  sender_mode: 'meta_coexistence_app',
+                  status: 'sent',
+                  credits_deducted: 0,
+                  error_message: echoText.substring(0, 500)
+                });
+              }
+            }
+          }
+
+          // C. Coexistence: smb_app_state_sync
+          // Triggers when mobile WhatsApp Business App state/contacts sync
+          else if (field === 'smb_app_state_sync') {
+            const phoneNumberId = val?.metadata?.phone_number_id;
+            const integration = phoneNumberId
+              ? await metaWhatsAppService.findIntegrationByPhoneNumber(phoneNumberId)
+              : await metaWhatsAppService.findIntegrationByWaba(wabaId);
+
+            if (integration) {
+              const currentStatus = integration.coexistence_status || {};
+              await supabaseAdmin
+                .from('gym_whatsapp_integrations')
+                .update({
+                  coexistence_status: {
+                    ...currentStatus,
+                    last_app_state_sync_at: new Date().toISOString(),
+                    sync_data_summary: val?.state || 'synced'
+                  },
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', integration.id);
+            }
+          }
+
+          // D. Coexistence: history sync
+          // Triggers when chat history is imported from the mobile app during onboarding
+          else if (field === 'history') {
+            const phoneNumberId = val?.metadata?.phone_number_id;
+            const integration = phoneNumberId
+              ? await metaWhatsAppService.findIntegrationByPhoneNumber(phoneNumberId)
+              : await metaWhatsAppService.findIntegrationByWaba(wabaId);
+
+            if (integration) {
+              const currentStatus = integration.coexistence_status || {};
+              await supabaseAdmin
+                .from('gym_whatsapp_integrations')
+                .update({
+                  coexistence_status: {
+                    ...currentStatus,
+                    history_sync_completed_at: new Date().toISOString(),
+                    history_status: val?.status || 'completed'
+                  },
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', integration.id);
+            }
+          }
+
+          // E. account_update: WABA or Phone Number quality / ban / tier update
+          else if (field === 'account_update') {
+            const integration = await metaWhatsAppService.findIntegrationByWaba(wabaId);
+            if (integration) {
+              const currentStatus = integration.coexistence_status || {};
+              await supabaseAdmin
+                .from('gym_whatsapp_integrations')
+                .update({
+                  coexistence_status: {
+                    ...currentStatus,
+                    last_account_update: val,
+                    last_account_update_at: new Date().toISOString()
+                  },
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', integration.id);
+            }
           }
         }
       }
     }
+
     res.status(200).send('EVENT_RECEIVED');
   } catch (error) {
     console.error('Error handling Meta webhook:', error);
-    res.status(200).send('EVENT_RECEIVED'); // Always acknowledge to Meta
+    res.status(200).send('EVENT_RECEIVED'); // Always acknowledge 200 to Meta
   }
 };

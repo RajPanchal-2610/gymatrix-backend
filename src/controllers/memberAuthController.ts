@@ -178,7 +178,8 @@ export const loginMember = async (req: Request, res: Response) => {
         gyms (
           id, 
           name, 
-          logo_url
+          logo_url,
+          notification_settings
         )
       `)
       .eq('is_deleted', false)
@@ -245,6 +246,7 @@ export const loginMember = async (req: Request, res: Response) => {
         status: member.status,
         expiry_date: member.expiry_date,
         plan_name: planInfo?.name || 'No Active Plan',
+        upi_settings: gymInfo?.notification_settings?.upi_settings || null,
       },
     });
   } catch (error: any) {
@@ -283,7 +285,8 @@ export const getMemberMe = async (req: AuthenticatedMemberRequest, res: Response
         gyms (
           id,
           name,
-          logo_url
+          logo_url,
+          notification_settings
         ),
         gym_staff (
           id,
@@ -316,7 +319,7 @@ export const getMemberDashboardData = async (req: AuthenticatedMemberRequest, re
       .select(`
         *,
         gym_membership_plans (id, name, price, duration_value, duration_unit),
-        gyms (id, name, logo_url),
+        gyms (id, name, logo_url, notification_settings),
         gym_staff (id, full_name, phone)
       `)
       .eq('id', memberId)
@@ -543,5 +546,77 @@ export const changeMemberPassword = async (req: AuthenticatedMemberRequest, res:
     res.json({ message: 'Password updated successfully' });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to change password' });
+  }
+};
+
+// 6. SUBMIT UPI PAYMENT REFERENCE (UTR) FOR VERIFICATION
+export const submitPaymentReference = async (req: AuthenticatedMemberRequest, res: Response) => {
+  try {
+    const memberId = req.member?.id;
+    const gymId = req.member?.gym_id;
+    const memberName = req.member?.full_name || 'Member';
+    const { invoiceId, utrNumber, amount } = req.body;
+
+    if (!utrNumber || !utrNumber.trim()) {
+      return res.status(400).json({ error: 'Please enter a valid UPI transaction reference (UTR) number.' });
+    }
+
+    const cleanUtr = utrNumber.trim();
+
+    // Find the invoice to associate
+    let targetInvoiceId = invoiceId;
+    if (!targetInvoiceId) {
+      const { data: latestPayment } = await supabaseAdmin
+        .from('gym_membership_payments')
+        .select('id, due_amount')
+        .eq('member_id', memberId)
+        .eq('is_deleted', false)
+        .neq('payment_status', 'paid')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      targetInvoiceId = latestPayment?.id;
+    }
+
+    if (targetInvoiceId) {
+      // Record transaction with mode 'UPI (Pending Verification)'
+      const { error: txnErr } = await supabaseAdmin
+        .from('gym_payment_transactions')
+        .insert({
+          membership_payment_id: targetInvoiceId,
+          gym_id: gymId,
+          payment_mode: 'UPI (Pending Verification)',
+          amount: Number(amount) || 0,
+          transaction_reference: cleanUtr,
+          paid_at: new Date().toISOString()
+        });
+
+      if (txnErr) {
+        console.error('Error recording payment transaction:', txnErr);
+      }
+    }
+
+    // Insert system notification for the gym
+    try {
+      await supabaseAdmin
+        .from('notifications')
+        .insert({
+          gym_id: gymId,
+          title: 'UPI Payment Verification Requested',
+          message: `${memberName} submitted UPI payment of ₹${Number(amount || 0).toLocaleString()} (UTR: ${cleanUtr}). Please verify and approve it in Payments.`,
+          type: 'payment'
+        });
+    } catch (notifErr) {
+      console.warn('Non-blocking notification error:', notifErr);
+    }
+
+    return res.json({
+      success: true,
+      message: 'Payment reference submitted successfully! The gym management will verify and confirm your invoice.'
+    });
+  } catch (error: any) {
+    console.error('Submit payment reference error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to submit payment reference' });
   }
 };
