@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { supabaseAdmin } from '../lib/supabase';
 import { emailService } from './emailService';
 import { metaWhatsAppService } from './metaWhatsAppService';
+import { webPushService } from './webPushService';
 
 interface SubscriptionWithUser {
   id: number;
@@ -247,6 +248,14 @@ export class SubscriptionScheduler {
                 type: 'system'
               });
             console.log(`✉️ In-app notification created for user ${subscription.user_id}`);
+
+            // Web Push notification to user device
+            webPushService.sendToUser(subscription.user_id, {
+              title: isTrial ? 'Trial Expiring Soon' : 'Subscription Renewal Due',
+              body: `Your Gymatrix ${planName} ${isTrial ? 'trial' : 'subscription'} will expire in 3 days on ${expiryDate}.`,
+              url: '/pricing',
+              tag: `sub-expiring-${subscription.id}`
+            }).catch(() => {});
           } catch (notifError) {
             console.error('❌ Failed to insert in-app notification for subscription expiry:', notifError);
           }
@@ -547,6 +556,23 @@ export class SubscriptionScheduler {
             } else {
               console.log(`✉️ [Gym ${history.gym_id}] ${title}: ${memberName} (offset: ${check.offset}, targetUser: ${targetUserId})`);
 
+              // Automated Web Push Notification to Gym Dashboard Devices
+              if (targetGymId) {
+                webPushService.sendToGym(targetGymId, {
+                  title,
+                  body: message,
+                  url: '/members',
+                  tag: `membership-${history.member_id}-${check.offset}`
+                }).catch(() => {});
+              } else if (targetUserId) {
+                webPushService.sendToUser(targetUserId, {
+                  title,
+                  body: message,
+                  url: '/members',
+                  tag: `membership-${history.member_id}-${check.offset}`
+                }).catch(() => {});
+              }
+
               // Automated WhatsApp Alert via Meta Cloud API
               if (member?.phone) {
                 metaWhatsAppService.sendMembershipExpiryAlert({
@@ -718,6 +744,23 @@ export class SubscriptionScheduler {
               type: 'payment_reminder'
             });
 
+            // Web Push notification to gym devices
+            if (targetGymId) {
+              webPushService.sendToGym(targetGymId, {
+                title,
+                body: message,
+                url: '/payments',
+                tag: `payment-reminder-${payment.id}`
+              }).catch(() => {});
+            } else if (targetUserId) {
+              webPushService.sendToUser(targetUserId, {
+                title,
+                body: message,
+                url: '/payments',
+                tag: `payment-reminder-${payment.id}`
+              }).catch(() => {});
+            }
+
             if (member?.phone) {
               metaWhatsAppService.sendPaymentReminder({
                 gymId: gym.id,
@@ -878,6 +921,27 @@ export class SubscriptionScheduler {
             console.error(`❌ Failed to create overdue notification for ${memberName}:`, insertError);
           } else {
             console.log(`✉️ [Gym ${gym.id}] Overdue payment notification: ${memberName} (₹${payment.due_amount})`);
+
+            // Web Push notification to gym devices
+            if (targetGymId) {
+              webPushService.sendToGym(targetGymId, {
+                title: isPtPayment ? 'PT Fee Overdue Alert' : 'Overdue Payment Alert',
+                body: isPtPayment
+                  ? `${memberName} has an overdue Personal Training Fee of ₹${payment.due_amount}, due on ${billingDateStr}.`
+                  : `${memberName} has an overdue payment of ₹${payment.due_amount} for '${planName}', due on ${billingDateStr}.`,
+                url: '/payments',
+                tag: `payment-overdue-${payment.id}`
+              }).catch(() => {});
+            } else if (targetUserId) {
+              webPushService.sendToUser(targetUserId, {
+                title: isPtPayment ? 'PT Fee Overdue Alert' : 'Overdue Payment Alert',
+                body: isPtPayment
+                  ? `${memberName} has an overdue Personal Training Fee of ₹${payment.due_amount}, due on ${billingDateStr}.`
+                  : `${memberName} has an overdue payment of ₹${payment.due_amount} for '${planName}', due on ${billingDateStr}.`,
+                url: '/payments',
+                tag: `payment-overdue-${payment.id}`
+              }).catch(() => {});
+            }
 
             // Automated WhatsApp Payment Reminder via Meta Cloud API
             if (member?.phone) {
